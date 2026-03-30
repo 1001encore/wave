@@ -1,0 +1,6 @@
+.venv/
+.wave/
+testdata/**/.wave/
+wave
+*.db
+*.sqlite
