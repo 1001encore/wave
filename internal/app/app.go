@@ -30,6 +30,7 @@ type commandContext struct {
 	jsonOut  bool
 	limit    int
 	explain  bool
+	mode     string
 }
 
 type defOccurrence struct {
@@ -248,7 +249,7 @@ func runSearch(ctx context.Context, args []string) int {
 	defer st.Close()
 
 	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
-	result, err := router.Search(ctx, unit.RootPath, query, cc.limit)
+	result, err := router.Search(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
 	}
@@ -384,7 +385,7 @@ func runContext(ctx context.Context, args []string) int {
 	defer st.Close()
 
 	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
-	result, err := router.Context(ctx, unit.RootPath, query, cc.limit)
+	result, err := router.Context(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
 	}
@@ -444,6 +445,7 @@ func bindCommonFlags(fs *flag.FlagSet) *commandContext {
 	fs.BoolVar(&cc.jsonOut, "json", false, "emit JSON")
 	fs.IntVar(&cc.limit, "limit", 10, "result limit")
 	fs.BoolVar(&cc.explain, "explain", false, "include routing and freshness details")
+	fs.StringVar(&cc.mode, "mode", "auto", "query mode: auto, hybrid, symbol, semantic, graph")
 	return cc
 }
 
@@ -610,12 +612,22 @@ func buildPayload(
 		chunks[i].RetrievalText = buildRetrievalText(chunks[i], symbolMap[chunks[i].PrimarySymbol])
 	}
 
-	embedDocs := make([]embed.Document, 0, len(chunks))
+	embedDocs := make([]embed.Document, 0, len(chunks)+len(symbolMap))
 	for _, chunk := range chunks {
 		embedDocs = append(embedDocs, embed.Document{
 			OwnerType: "chunk",
 			OwnerKey:  chunk.Key,
 			Text:      chunk.RetrievalText,
+		})
+	}
+	for _, symbol := range symbolMap {
+		if symbol.ScipSymbol == "" || symbol.FilePath == "" {
+			continue
+		}
+		embedDocs = append(embedDocs, embed.Document{
+			OwnerType: "symbol",
+			OwnerKey:  symbol.ScipSymbol,
+			Text:      buildSymbolRetrievalText(symbol),
 		})
 	}
 	vectors, err := embedder.Embed(ctx, embedDocs)
@@ -624,11 +636,11 @@ func buildPayload(
 	}
 	vectorByKey := make(map[string][]float32, len(vectors))
 	for _, vector := range vectors {
-		vectorByKey[vector.OwnerKey] = vector.Values
+		vectorByKey[embeddingMapKey(vector.OwnerType, vector.OwnerKey)] = vector.Values
 	}
 	embeddings := make([]store.EmbeddingData, 0, len(embedDocs))
 	for _, doc := range embedDocs {
-		vector := vectorByKey[doc.OwnerKey]
+		vector := vectorByKey[embeddingMapKey(doc.OwnerType, doc.OwnerKey)]
 		if len(vector) == 0 {
 			continue
 		}
@@ -697,6 +709,37 @@ func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
 	}
 	b.WriteString("\ncode:\n")
 	b.WriteString(chunk.Text)
+	return b.String()
+}
+
+func buildSymbolRetrievalText(symbol store.SymbolData) string {
+	var b strings.Builder
+	b.WriteString("symbol: ")
+	b.WriteString(symbol.DisplayName)
+	if symbol.Kind != "" {
+		b.WriteString("\nkind: ")
+		b.WriteString(symbol.Kind)
+	}
+	if symbol.FilePath != "" {
+		b.WriteString("\nfile: ")
+		b.WriteString(symbol.FilePath)
+	}
+	if symbol.EnclosingSymbol != "" {
+		b.WriteString("\nenclosing: ")
+		b.WriteString(symbol.EnclosingSymbol)
+	}
+	if symbol.Signature != "" {
+		b.WriteString("\nsignature: ")
+		b.WriteString(symbol.Signature)
+	}
+	if symbol.DocSummary != "" {
+		b.WriteString("\ndoc: ")
+		b.WriteString(symbol.DocSummary)
+	}
+	if symbol.ScipSymbol != "" {
+		b.WriteString("\nscip: ")
+		b.WriteString(symbol.ScipSymbol)
+	}
 	return b.String()
 }
 
@@ -801,6 +844,10 @@ func dedupeEdges(edges []store.EdgeData) []store.EdgeData {
 	return out
 }
 
+func embeddingMapKey(ownerType string, ownerKey string) string {
+	return ownerType + "\x00" + ownerKey
+}
+
 func sha256Hex(content []byte) string {
 	sum := sha256.Sum256(content)
 	return hex.EncodeToString(sum[:])
@@ -836,7 +883,7 @@ func printUsage() {
 Commands:
   index     Index the current Python project with SCIP + Tree-sitter
   status    Show indexed project status
-  search    Search indexed chunks
+  search    Search indexed symbols/chunks
   def       Resolve a symbol definition
   refs      List symbol references
   context   Build a small contextual bundle around a search hit

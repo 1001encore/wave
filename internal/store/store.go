@@ -14,7 +14,10 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const chunkEmbeddingDimensions = 768
+const (
+	chunkEmbeddingDimensions  = 768
+	symbolEmbeddingDimensions = 768
+)
 
 var sqliteVecAuto sync.Once
 
@@ -165,6 +168,22 @@ type SearchHit struct {
 	HeaderText      string  `json:"header_text"`
 	Text            string  `json:"text"`
 	Score           float64 `json:"score"`
+}
+
+type SymbolSearchHit struct {
+	SymbolID    int64   `json:"symbol_id"`
+	ScipSymbol  string  `json:"scip_symbol"`
+	DisplayName string  `json:"display_name"`
+	Kind        string  `json:"kind"`
+	Path        string  `json:"path"`
+	StartLine   int     `json:"start_line"`
+	StartCol    int     `json:"start_col"`
+	EndLine     int     `json:"end_line"`
+	EndCol      int     `json:"end_col"`
+	DocSummary  string  `json:"doc_summary"`
+	Signature   string  `json:"signature"`
+	Enclosing   string  `json:"enclosing_symbol"`
+	Score       float64 `json:"score"`
 }
 
 type DefinitionResult struct {
@@ -333,6 +352,11 @@ func (s *Store) migrate() error {
 	)`, chunkEmbeddingDimensions)); err != nil {
 		return fmt.Errorf("create vector table: %w", err)
 	}
+	if _, err := s.db.Exec(fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
+		embedding float[%d]
+	)`, symbolEmbeddingDimensions)); err != nil {
+		return fmt.Errorf("create symbol vector table: %w", err)
+	}
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN adapter_id TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("migrate adapter_id column: %w", err)
 	}
@@ -355,6 +379,9 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	if oldErr == nil {
 		if _, err = tx.ExecContext(ctx, `DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE project_id = ?)`, oldProjectID); err != nil {
 			return fmt.Errorf("delete old vector rows: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `DELETE FROM vec_symbols WHERE rowid IN (SELECT id FROM symbols WHERE project_id = ?)`, oldProjectID); err != nil {
+			return fmt.Errorf("delete old symbol vector rows: %w", err)
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, oldProjectID); err != nil {
 			return fmt.Errorf("delete old project: %w", err)
@@ -578,21 +605,37 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	}
 
 	for _, embedding := range payload.Embeddings {
-		chunkID, ok := chunkIDs[embedding.OwnerKey]
-		if !ok {
-			continue
-		}
 		blob, blobErr := vec.SerializeFloat32(embedding.Vector)
 		if blobErr != nil {
 			return fmt.Errorf("serialize embedding for %s: %w", embedding.OwnerKey, blobErr)
 		}
-		if _, execErr := tx.ExecContext(
-			ctx,
-			`INSERT INTO vec_chunks (rowid, embedding) VALUES (?, ?)`,
-			chunkID,
-			blob,
-		); execErr != nil {
-			return fmt.Errorf("insert vector for %s: %w", embedding.OwnerKey, execErr)
+		switch embedding.OwnerType {
+		case "chunk":
+			chunkID, ok := chunkIDs[embedding.OwnerKey]
+			if !ok {
+				continue
+			}
+			if _, execErr := tx.ExecContext(
+				ctx,
+				`INSERT INTO vec_chunks (rowid, embedding) VALUES (?, ?)`,
+				chunkID,
+				blob,
+			); execErr != nil {
+				return fmt.Errorf("insert chunk vector for %s: %w", embedding.OwnerKey, execErr)
+			}
+		case "symbol":
+			symbolID, ok := symbolIDs[embedding.OwnerKey]
+			if !ok {
+				continue
+			}
+			if _, execErr := tx.ExecContext(
+				ctx,
+				`INSERT INTO vec_symbols (rowid, embedding) VALUES (?, ?)`,
+				symbolID,
+				blob,
+			); execErr != nil {
+				return fmt.Errorf("insert symbol vector for %s: %w", embedding.OwnerKey, execErr)
+			}
 		}
 	}
 
@@ -823,6 +866,175 @@ func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vecto
 			&hit.Score,
 		); err != nil {
 			return nil, fmt.Errorf("scan semantic hit: %w", err)
+		}
+		hits = append(hits, hit)
+	}
+	return hits, rows.Err()
+}
+
+func (s *Store) SearchSymbols(ctx context.Context, rootPath string, query string, limit int) ([]SymbolSearchHit, error) {
+	projectID, err := s.projectID(ctx, rootPath)
+	if err != nil {
+		return nil, err
+	}
+
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("empty symbol query")
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`SELECT
+			s.id,
+			s.scip_symbol,
+			s.display_name,
+			s.kind,
+			COALESCE(f.abs_path, ''),
+			s.def_start_line,
+			s.def_start_col,
+			s.def_end_line,
+			s.def_end_col,
+			s.doc_summary,
+			s.signature,
+			s.enclosing_symbol,
+			CASE
+				WHEN s.display_name = ? THEN 1.0
+				WHEN s.scip_symbol = ? THEN 0.98
+				WHEN s.display_name LIKE ? THEN 0.86
+				WHEN s.scip_symbol LIKE ? THEN 0.82
+				WHEN s.doc_summary LIKE ? THEN 0.55
+				WHEN s.signature LIKE ? THEN 0.45
+				ELSE 0.30
+			END AS score
+		FROM symbols s
+		LEFT JOIN files f ON f.id = s.file_id
+		WHERE s.project_id = ? AND (
+			s.display_name = ? OR
+			s.scip_symbol = ? OR
+			s.display_name LIKE ? OR
+			s.scip_symbol LIKE ? OR
+			s.doc_summary LIKE ? OR
+			s.signature LIKE ?
+		)
+		ORDER BY score DESC, LENGTH(s.display_name), s.display_name
+		LIMIT ?`,
+		query,
+		query,
+		query+"%",
+		"%"+query+"%",
+		"%"+query+"%",
+		"%"+query+"%",
+		projectID,
+		query,
+		query,
+		query+"%",
+		"%"+query+"%",
+		"%"+query+"%",
+		"%"+query+"%",
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("search symbols: %w", err)
+	}
+	defer rows.Close()
+
+	var hits []SymbolSearchHit
+	for rows.Next() {
+		var hit SymbolSearchHit
+		if err := rows.Scan(
+			&hit.SymbolID,
+			&hit.ScipSymbol,
+			&hit.DisplayName,
+			&hit.Kind,
+			&hit.Path,
+			&hit.StartLine,
+			&hit.StartCol,
+			&hit.EndLine,
+			&hit.EndCol,
+			&hit.DocSummary,
+			&hit.Signature,
+			&hit.Enclosing,
+			&hit.Score,
+		); err != nil {
+			return nil, fmt.Errorf("scan symbol hit: %w", err)
+		}
+		hits = append(hits, hit)
+	}
+	return hits, rows.Err()
+}
+
+func (s *Store) SemanticSearchSymbols(ctx context.Context, rootPath string, vector []float32, limit int) ([]SymbolSearchHit, error) {
+	projectID, err := s.projectID(ctx, rootPath)
+	if err != nil {
+		return nil, err
+	}
+
+	queryBlob, err := vec.SerializeFloat32(vector)
+	if err != nil {
+		return nil, fmt.Errorf("serialize symbol query vector: %w", err)
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		`WITH knn AS (
+			SELECT
+				rowid AS symbol_id,
+				distance
+			FROM vec_symbols
+			WHERE embedding MATCH ?
+			ORDER BY distance
+			LIMIT ?
+		)
+		SELECT
+			s.id,
+			s.scip_symbol,
+			s.display_name,
+			s.kind,
+			COALESCE(f.abs_path, ''),
+			s.def_start_line,
+			s.def_start_col,
+			s.def_end_line,
+			s.def_end_col,
+			s.doc_summary,
+			s.signature,
+			s.enclosing_symbol,
+			knn.distance
+		FROM knn
+		JOIN symbols s ON s.id = knn.symbol_id
+		LEFT JOIN files f ON f.id = s.file_id
+		WHERE s.project_id = ?
+		ORDER BY knn.distance, s.display_name
+		LIMIT ?`,
+		queryBlob,
+		limit,
+		projectID,
+		limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("semantic symbol search: %w", err)
+	}
+	defer rows.Close()
+
+	var hits []SymbolSearchHit
+	for rows.Next() {
+		var hit SymbolSearchHit
+		if err := rows.Scan(
+			&hit.SymbolID,
+			&hit.ScipSymbol,
+			&hit.DisplayName,
+			&hit.Kind,
+			&hit.Path,
+			&hit.StartLine,
+			&hit.StartCol,
+			&hit.EndLine,
+			&hit.EndCol,
+			&hit.DocSummary,
+			&hit.Signature,
+			&hit.Enclosing,
+			&hit.Score,
+		); err != nil {
+			return nil, fmt.Errorf("scan semantic symbol hit: %w", err)
 		}
 		hits = append(hits, hit)
 	}
