@@ -18,6 +18,20 @@ Download the latest release from [GitHub Releases](https://github.com/1001encore
 | macOS Apple Silicon | `wave_darwin_arm64.tar.gz` |
 | Windows x86_64 | `wave_windows_amd64.zip` |
 
+#### One-line install (Windows PowerShell)
+
+```powershell
+$dest=Join-Path $env:LOCALAPPDATA "wave"; $zip=Join-Path $env:TEMP "wave_windows_amd64.zip"; Invoke-WebRequest -Uri "https://github.com/1001encore/wave/releases/latest/download/wave_windows_amd64.zip" -OutFile $zip; New-Item -ItemType Directory -Force -Path $dest | Out-Null; Expand-Archive -Path $zip -DestinationPath $dest -Force; Remove-Item $zip -Force; $userPath=[Environment]::GetEnvironmentVariable("Path","User"); if ([string]::IsNullOrWhiteSpace($userPath)) { $userPath=$dest } elseif (-not (($userPath -split ";") -contains $dest)) { $userPath="$userPath;$dest" }; [Environment]::SetEnvironmentVariable("Path",$userPath,"User"); $env:Path="$env:Path;$dest"; wave --help
+```
+
+Open a new terminal after running this so updated `PATH` is picked up everywhere.
+
+#### One-line install (Linux Bash)
+
+```bash
+ARCH="$(uname -m)"; case "$ARCH" in x86_64|amd64) A=amd64;; aarch64|arm64) A=arm64;; *) echo "Unsupported architecture: $ARCH" >&2; exit 1;; esac; TMP="$(mktemp -d)"; curl -fsSL -o "$TMP/wave.tar.gz" "https://github.com/1001encore/wave/releases/latest/download/wave_linux_${A}.tar.gz"; tar -xzf "$TMP/wave.tar.gz" -C "$TMP"; mkdir -p "$HOME/.local/bin"; install -m 0755 "$TMP/wave" "$HOME/.local/bin/wave"; rm -rf "$TMP"; command -v wave >/dev/null 2>&1 || { echo 'Add ~/.local/bin to PATH (for bash: echo '\''export PATH="$HOME/.local/bin:$PATH"'\'' >> ~/.bashrc && source ~/.bashrc)'; }; wave --help
+```
+
 ```bash
 # Example: Linux amd64
 curl -LO https://github.com/1001encore/wave/releases/latest/download/wave_linux_amd64.tar.gz
