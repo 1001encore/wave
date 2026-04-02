@@ -13,15 +13,16 @@ import (
 	"sort"
 	"strings"
 
-	"wave/internal/config"
-	"wave/internal/embed"
-	scip "wave/internal/gen/scippb"
-	"wave/internal/indexer"
-	"wave/internal/python"
-	queryrouter "wave/internal/query"
-	"wave/internal/scipgraph"
-	"wave/internal/store"
-	"wave/internal/workspace"
+	"github.com/1001encore/wave/internal/config"
+	"github.com/1001encore/wave/internal/embed"
+	scip "github.com/1001encore/wave/internal/gen/scippb"
+	"github.com/1001encore/wave/internal/indexer"
+	"github.com/1001encore/wave/internal/python"
+	queryrouter "github.com/1001encore/wave/internal/query"
+	"github.com/1001encore/wave/internal/scipgraph"
+	"github.com/1001encore/wave/internal/store"
+	"github.com/1001encore/wave/internal/typescript"
+	"github.com/1001encore/wave/internal/workspace"
 )
 
 type commandContext struct {
@@ -31,6 +32,7 @@ type commandContext struct {
 	limit    int
 	explain  bool
 	mode     string
+	device   string
 }
 
 type defOccurrence struct {
@@ -42,6 +44,7 @@ type defOccurrence struct {
 func adapters() []indexer.Adapter {
 	return []indexer.Adapter{
 		python.Adapter{},
+		typescript.Adapter{},
 	}
 }
 
@@ -103,7 +106,12 @@ func runIndex(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 
-	payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embed.ResolveONNXProvider(unit.RootPath))
+	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
+	if err != nil {
+		return fail(err)
+	}
+
+	payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embedder)
 	if err != nil {
 		return fail(err)
 	}
@@ -122,7 +130,7 @@ func runIndex(ctx context.Context, args []string) int {
 		"edges":       len(payload.Edges),
 		"embeddings":  len(payload.Embeddings),
 	}
-	printResult(cc.jsonOut, result, fmt.Sprintf(
+	message := fmt.Sprintf(
 		"Indexed %s\nfiles: %d\nsymbols: %d\noccurrences: %d\nchunks: %d\nedges: %d\nembeddings: %d\nartifact: %s",
 		unit.RootPath,
 		len(payload.Files),
@@ -132,7 +140,15 @@ func runIndex(ctx context.Context, args []string) int {
 		len(payload.Edges),
 		len(payload.Embeddings),
 		indexResult.ArtifactPath,
-	))
+	)
+	if provider, ok := embedder.(embed.DiagnosticsProvider); ok {
+		stats := provider.LastStats()
+		if stats.Documents > 0 {
+			result["embedding_stats"] = stats
+			message += formatEmbedStats(stats)
+		}
+	}
+	printResult(cc.jsonOut, result, message)
 	return 0
 }
 
@@ -248,7 +264,11 @@ func runSearch(ctx context.Context, args []string) int {
 	_ = paths
 	defer st.Close()
 
-	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
+	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
+	if err != nil {
+		return fail(err)
+	}
+	router := queryrouter.NewRouter(st, embedder)
 	result, err := router.Search(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
@@ -294,13 +314,28 @@ func runDef(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
+	router := queryrouter.NewRouter(st, embed.NoopProvider{})
 	result, err := router.Definition(ctx, unit.RootPath, symbol)
 	if err != nil {
 		return fail(err)
 	}
 	printFreshnessWarning(ctx, st, adapter, unit, cc)
 	if result.Definition == nil {
+		if len(result.Candidates) > 0 {
+			if cc.jsonOut {
+				if cc.explain {
+					printJSON(result)
+				} else {
+					printJSON(result.Candidates)
+				}
+				return 1
+			}
+			fmt.Printf("Ambiguous symbol %q. Candidates:\n", symbol)
+			for _, candidate := range result.Candidates {
+				fmt.Printf("%s [%s] %s:%d:%d\n", candidate.DisplayName, firstNonEmpty(candidate.Kind, "symbol"), candidate.Path, candidate.StartLine+1, candidate.StartCol+1)
+			}
+			return 1
+		}
 		return fail(fmt.Errorf("no definition found for %q", symbol))
 	}
 	if cc.jsonOut {
@@ -340,12 +375,27 @@ func runRefs(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
+	router := queryrouter.NewRouter(st, embed.NoopProvider{})
 	result, err := router.References(ctx, unit.RootPath, symbol, cc.limit)
 	if err != nil {
 		return fail(err)
 	}
 	printFreshnessWarning(ctx, st, adapter, unit, cc)
+	if result.Definition == nil && len(result.Candidates) > 0 {
+		if cc.jsonOut {
+			if cc.explain {
+				printJSON(result)
+			} else {
+				printJSON(result.Candidates)
+			}
+			return 1
+		}
+		fmt.Printf("Ambiguous symbol %q. Candidates:\n", symbol)
+		for _, candidate := range result.Candidates {
+			fmt.Printf("%s [%s] %s:%d:%d\n", candidate.DisplayName, firstNonEmpty(candidate.Kind, "symbol"), candidate.Path, candidate.StartLine+1, candidate.StartCol+1)
+		}
+		return 1
+	}
 	if cc.jsonOut {
 		if cc.explain {
 			printJSON(result)
@@ -384,7 +434,11 @@ func runContext(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	router := queryrouter.NewRouter(st, embed.ResolveONNXProvider(unit.RootPath))
+	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
+	if err != nil {
+		return fail(err)
+	}
+	router := queryrouter.NewRouter(st, embedder)
 	result, err := router.Context(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
@@ -446,6 +500,7 @@ func bindCommonFlags(fs *flag.FlagSet) *commandContext {
 	fs.IntVar(&cc.limit, "limit", 10, "result limit")
 	fs.BoolVar(&cc.explain, "explain", false, "include routing and freshness details")
 	fs.StringVar(&cc.mode, "mode", "auto", "query mode: auto, hybrid, symbol, semantic, graph")
+	fs.StringVar(&cc.device, "device", "", "embedding device: cpu, cuda (default: auto-detect)")
 	return cc
 }
 
@@ -486,6 +541,7 @@ func buildPayload(
 
 	for _, external := range index.GetExternalSymbols() {
 		symbolMap[external.GetSymbol()] = toSymbolData(external, "", adapter.NormalizeDisplayName)
+		edges = append(edges, relationshipEdges(external)...)
 	}
 
 	for _, doc := range index.GetDocuments() {
@@ -507,6 +563,7 @@ func buildPayload(
 		for _, info := range doc.GetSymbols() {
 			data := toSymbolData(info, relativePath, adapter.NormalizeDisplayName)
 			symbolMap[data.ScipSymbol] = data
+			edges = append(edges, relationshipEdges(info)...)
 			if data.EnclosingSymbol != "" {
 				edges = append(edges, store.EdgeData{
 					SrcSymbol:  data.EnclosingSymbol,
@@ -539,7 +596,7 @@ func buildPayload(
 					symbolMap[occ.GetSymbol()] = store.SymbolData{
 						ScipSymbol:  occ.GetSymbol(),
 						DisplayName: adapter.NormalizeDisplayName(occ.GetSymbol()),
-						Kind:        "unknown",
+						Kind:        "symbol",
 					}
 				}
 			}
@@ -557,7 +614,7 @@ func buildPayload(
 				EnclosingEndLine:   enclosing.EndLine,
 				EnclosingEndCol:    enclosing.EndCol,
 				RoleBits:           int(occ.GetSymbolRoles()),
-				SyntaxKind:         occ.GetSyntaxKind().String(),
+				SyntaxKind:         firstNonEmpty(scipgraph.NormalizeSyntaxKind(occ.GetSyntaxKind()), "reference"),
 				IsDefinition:       flags.Definition,
 				IsImport:           flags.Import,
 				IsRead:             flags.Read,
@@ -611,23 +668,14 @@ func buildPayload(
 	for i := range chunks {
 		chunks[i].RetrievalText = buildRetrievalText(chunks[i], symbolMap[chunks[i].PrimarySymbol])
 	}
+	chunkSymbols := deriveChunkSymbolLinks(chunks, occurrences)
 
-	embedDocs := make([]embed.Document, 0, len(chunks)+len(symbolMap))
+	embedDocs := make([]embed.Document, 0, len(chunks))
 	for _, chunk := range chunks {
 		embedDocs = append(embedDocs, embed.Document{
 			OwnerType: "chunk",
 			OwnerKey:  chunk.Key,
 			Text:      chunk.RetrievalText,
-		})
-	}
-	for _, symbol := range symbolMap {
-		if symbol.ScipSymbol == "" || symbol.FilePath == "" {
-			continue
-		}
-		embedDocs = append(embedDocs, embed.Document{
-			OwnerType: "symbol",
-			OwnerKey:  symbol.ScipSymbol,
-			Text:      buildSymbolRetrievalText(symbol),
 		})
 	}
 	vectors, err := embedder.Embed(ctx, embedDocs)
@@ -680,12 +728,13 @@ func buildPayload(
 			ToolName:          indexResult.ToolName,
 			ToolVersion:       indexResult.ToolVersion,
 		},
-		Files:       files,
-		Symbols:     symbols,
-		Occurrences: occurrences,
-		Chunks:      chunks,
-		Edges:       dedupeEdges(edges),
-		Embeddings:  embeddings,
+		Files:        files,
+		Symbols:      symbols,
+		Occurrences:  occurrences,
+		Chunks:       chunks,
+		ChunkSymbols: chunkSymbols,
+		Edges:        dedupeEdges(edges),
+		Embeddings:   embeddings,
 	}, nil
 }
 
@@ -710,6 +759,59 @@ func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
 	b.WriteString("\ncode:\n")
 	b.WriteString(chunk.Text)
 	return b.String()
+}
+
+func formatEmbedStats(stats embed.Stats) string {
+	out := fmt.Sprintf(
+		"\nembed_provider: %s\nembed_docs: %d\nembed_dim: %d\nembed_batch: requested=%d settled=%d batches=%d oom_retries=%d\nembed_timing_ms: total=%.1f request=%.1f preload=%.1f session=%.1f tokenize=%.1f infer=%.1f normalize=%.1f serialize=%.1f decode=%.1f",
+		firstNonEmpty(stats.Provider, "unknown"),
+		stats.Documents,
+		stats.Dimensions,
+		stats.RequestedBatch,
+		stats.SelectedBatch,
+		stats.BatchCount,
+		stats.OOMRetries,
+		stats.TotalMS,
+		stats.RequestMS,
+		stats.PreloadMS,
+		stats.SessionMS,
+		stats.TokenizeMS,
+		stats.InferMS,
+		stats.NormalizeMS,
+		stats.SerializeMS,
+		stats.DecodeMS,
+	)
+	if len(stats.BatchStats) > 0 {
+		out += "\nembed_batch_samples:"
+		for _, sample := range sampleBatchStats(stats.BatchStats, 6) {
+			out += fmt.Sprintf(
+				"\n  #%d size=%d processed=%d tokenize=%.1f infer=%.1f normalize=%.1f retries=%d settled=%d",
+				sample.Index,
+				sample.Size,
+				sample.Processed,
+				sample.TokenizeMS,
+				sample.InferMS,
+				sample.NormalizeMS,
+				sample.RetryCount,
+				sample.SettledBatch,
+			)
+		}
+	}
+	return out
+}
+
+func sampleBatchStats(items []embed.BatchStats, maxItems int) []embed.BatchStats {
+	if len(items) <= maxItems {
+		return items
+	}
+	keep := maxItems / 2
+	if keep < 1 {
+		keep = 1
+	}
+	out := make([]embed.BatchStats, 0, keep*2)
+	out = append(out, items[:keep]...)
+	out = append(out, items[len(items)-keep:]...)
+	return out
 }
 
 func buildSymbolRetrievalText(symbol store.SymbolData) string {
@@ -741,6 +843,120 @@ func buildSymbolRetrievalText(symbol store.SymbolData) string {
 		b.WriteString(symbol.ScipSymbol)
 	}
 	return b.String()
+}
+
+func deriveChunkSymbolLinks(chunks []store.ChunkData, occurrences []store.OccurrenceData) []store.ChunkSymbolLinkData {
+	fileChunks := map[string][]store.ChunkData{}
+	for _, chunk := range chunks {
+		fileChunks[chunk.FilePath] = append(fileChunks[chunk.FilePath], chunk)
+	}
+
+	fileOccurrences := map[string][]store.OccurrenceData{}
+	for _, occ := range occurrences {
+		if occ.Symbol == "" {
+			continue
+		}
+		fileOccurrences[occ.FilePath] = append(fileOccurrences[occ.FilePath], occ)
+	}
+
+	out := make([]store.ChunkSymbolLinkData, 0, len(chunks)*2)
+	seen := map[string]struct{}{}
+	add := func(chunkKey string, symbol string, role string, weight float64) {
+		if chunkKey == "" || symbol == "" || role == "" || weight <= 0 {
+			return
+		}
+		key := chunkKey + "\x00" + symbol + "\x00" + role
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, store.ChunkSymbolLinkData{
+			ChunkKey: chunkKey,
+			Symbol:   symbol,
+			Role:     role,
+			Weight:   weight,
+		})
+	}
+
+	for filePath, chunkGroup := range fileChunks {
+		occGroup := fileOccurrences[filePath]
+		sort.Slice(occGroup, func(i, j int) bool {
+			if occGroup[i].StartLine == occGroup[j].StartLine {
+				return occGroup[i].StartCol < occGroup[j].StartCol
+			}
+			return occGroup[i].StartLine < occGroup[j].StartLine
+		})
+
+		for _, chunk := range chunkGroup {
+			if chunk.PrimarySymbol != "" {
+				add(chunk.Key, chunk.PrimarySymbol, "defines", 1.0)
+			}
+
+			start := sort.Search(len(occGroup), func(i int) bool {
+				return occGroup[i].StartLine >= chunk.StartLine
+			})
+			for i := start; i < len(occGroup); i++ {
+				occ := occGroup[i]
+				if occ.StartLine > chunk.EndLine {
+					break
+				}
+				if !chunkContainsOccurrence(chunk, occ) {
+					continue
+				}
+				addChunkSymbolRoles(add, chunk.Key, occ)
+			}
+		}
+	}
+
+	return out
+}
+
+func addChunkSymbolRoles(add func(string, string, string, float64), chunkKey string, occ store.OccurrenceData) {
+	if occ.IsDefinition {
+		add(chunkKey, occ.Symbol, "defines", 1.0)
+	}
+	if occ.IsImport {
+		add(chunkKey, occ.Symbol, "imports", 0.65)
+	}
+	if occ.IsWrite {
+		add(chunkKey, occ.Symbol, "writes", 0.75)
+	}
+	if occ.IsRead {
+		add(chunkKey, occ.Symbol, "reads", 0.6)
+	}
+	addedAccess := occ.IsDefinition || occ.IsImport || occ.IsWrite || occ.IsRead
+	if !addedAccess || strings.HasPrefix(occ.SyntaxKind, "identifier") {
+		add(chunkKey, occ.Symbol, "uses", 0.55)
+	}
+}
+
+func chunkContainsOccurrence(chunk store.ChunkData, occ store.OccurrenceData) bool {
+	if chunk.FilePath != occ.FilePath {
+		return false
+	}
+	if comparePosition(occ.StartLine, occ.StartCol, chunk.StartLine, chunk.StartCol) < 0 {
+		return false
+	}
+	if comparePosition(occ.EndLine, occ.EndCol, chunk.EndLine, chunk.EndCol) > 0 {
+		return false
+	}
+	return true
+}
+
+func comparePosition(lineA int, colA int, lineB int, colB int) int {
+	if lineA < lineB {
+		return -1
+	}
+	if lineA > lineB {
+		return 1
+	}
+	if colA < colB {
+		return -1
+	}
+	if colA > colB {
+		return 1
+	}
+	return 0
 }
 
 func assignPrimarySymbols(
@@ -787,13 +1003,58 @@ func toSymbolData(
 	data := store.SymbolData{
 		ScipSymbol:      info.GetSymbol(),
 		DisplayName:     firstNonEmpty(info.GetDisplayName(), normalizeDisplayName(info.GetSymbol())),
-		Kind:            info.GetKind().String(),
+		Kind:            firstNonEmpty(scipgraph.NormalizeSymbolKind(info.GetKind()), "symbol"),
 		FilePath:        filePath,
 		Signature:       "",
 		DocSummary:      scipgraph.DocumentationSummary(info.GetDocumentation()),
 		EnclosingSymbol: info.GetEnclosingSymbol(),
 	}
 	return data
+}
+
+func relationshipEdges(info *scip.SymbolInformation) []store.EdgeData {
+	if info == nil || info.GetSymbol() == "" {
+		return nil
+	}
+	var edges []store.EdgeData
+	for _, rel := range info.GetRelationships() {
+		if rel == nil || rel.GetSymbol() == "" {
+			continue
+		}
+		if rel.GetIsReference() {
+			edges = append(edges, store.EdgeData{
+				SrcSymbol:  info.GetSymbol(),
+				DstSymbol:  rel.GetSymbol(),
+				Kind:       "reference",
+				Provenance: "scip",
+			})
+		}
+		if rel.GetIsImplementation() {
+			edges = append(edges, store.EdgeData{
+				SrcSymbol:  info.GetSymbol(),
+				DstSymbol:  rel.GetSymbol(),
+				Kind:       "implementation",
+				Provenance: "scip",
+			})
+		}
+		if rel.GetIsTypeDefinition() {
+			edges = append(edges, store.EdgeData{
+				SrcSymbol:  info.GetSymbol(),
+				DstSymbol:  rel.GetSymbol(),
+				Kind:       "type_definition",
+				Provenance: "scip",
+			})
+		}
+		if rel.GetIsDefinition() {
+			edges = append(edges, store.EdgeData{
+				SrcSymbol:  info.GetSymbol(),
+				DstSymbol:  rel.GetSymbol(),
+				Kind:       "definition",
+				Provenance: "scip",
+			})
+		}
+	}
+	return edges
 }
 
 func mapsToSortedFiles(fileMap map[string]store.FileData) []store.FileData {
@@ -878,10 +1139,10 @@ func min(a, b int) int {
 }
 
 func printUsage() {
-	fmt.Println(`wave <command> [flags]
+	fmt.Print(`wave <command> [flags]
 
 Commands:
-  index     Index the current Python project with SCIP + Tree-sitter
+  index     Index the current project with SCIP + Tree-sitter
   status    Show indexed project status
   search    Search indexed symbols/chunks
   def       Resolve a symbol definition

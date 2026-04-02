@@ -3,9 +3,10 @@ package scipgraph
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
-	scip "wave/internal/gen/scippb"
+	scip "github.com/1001encore/wave/internal/gen/scippb"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -73,4 +74,31 @@ func DocumentationSummary(lines []string) string {
 		return joined[:400]
 	}
 	return joined
+}
+
+var camelBoundary = regexp.MustCompile(`([a-z0-9])([A-Z])`)
+
+func NormalizeSymbolKind(kind scip.SymbolInformation_Kind) string {
+	if kind == scip.SymbolInformation_UnspecifiedKind {
+		return ""
+	}
+	return normalizeEnumLabel(kind.String(), "Kind")
+}
+
+func NormalizeSyntaxKind(kind scip.SyntaxKind) string {
+	if kind == scip.SyntaxKind_UnspecifiedSyntaxKind {
+		return ""
+	}
+	return normalizeEnumLabel(kind.String(), "SyntaxKind")
+}
+
+func normalizeEnumLabel(raw string, suffix string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "SymbolInformation_")
+	raw = strings.TrimPrefix(raw, "SyntaxKind_")
+	raw = strings.TrimSuffix(raw, suffix)
+	raw = camelBoundary.ReplaceAllString(raw, "${1}_${2}")
+	raw = strings.ToLower(raw)
+	raw = strings.Trim(raw, "_")
+	return raw
 }

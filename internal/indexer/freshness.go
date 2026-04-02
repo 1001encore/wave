@@ -7,8 +7,8 @@ import (
 	"fmt"
 	"os"
 
-	"wave/internal/store"
-	"wave/internal/workspace"
+	"github.com/1001encore/wave/internal/store"
+	"github.com/1001encore/wave/internal/workspace"
 )
 
 type Freshness struct {

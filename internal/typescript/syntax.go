@@ -1,4 +1,4 @@
-package python
+package typescript
 
 import (
 	"context"
@@ -6,9 +6,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unsafe"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
+	tree_sitter_typescript "github.com/tree-sitter/tree-sitter-typescript/bindings/go"
 
 	"github.com/1001encore/wave/internal/syntax"
 )
@@ -19,9 +20,9 @@ func (SyntaxExtractor) Extract(ctx context.Context, filePath string, source []by
 	parser := tree_sitter.NewParser()
 	defer parser.Close()
 
-	lang := tree_sitter.NewLanguage(tree_sitter_python.Language())
+	lang := tree_sitter.NewLanguage(languageForFile(filePath))
 	if err := parser.SetLanguage(lang); err != nil {
-		return nil, fmt.Errorf("set python grammar: %w", err)
+		return nil, fmt.Errorf("set typescript grammar: %w", err)
 	}
 
 	tree := parser.ParseCtx(ctx, source, nil)
@@ -41,16 +42,38 @@ func (SyntaxExtractor) Extract(ctx context.Context, filePath string, source []by
 	return chunks, nil
 }
 
+func languageForFile(filePath string) unsafe.Pointer {
+	switch strings.ToLower(filepath.Ext(filePath)) {
+	case ".tsx":
+		return tree_sitter_typescript.LanguageTSX()
+	default:
+		return tree_sitter_typescript.LanguageTypescript()
+	}
+}
+
 func walkNode(filePath string, source []byte, node *tree_sitter.Node, chunks *[]syntax.Chunk) {
 	if node == nil {
 		return
 	}
 
 	switch node.Kind() {
-	case "class_definition", "function_definition", "import_statement", "import_from_statement":
+	case "import_statement",
+		"class_declaration",
+		"abstract_class_declaration",
+		"interface_declaration",
+		"enum_declaration",
+		"type_alias_declaration",
+		"function_declaration",
+		"generator_function_declaration",
+		"method_definition",
+		"method_signature",
+		"abstract_method_signature",
+		"public_field_definition":
 		*chunks = append(*chunks, buildNamedChunk(filePath, node.Kind(), node, source))
-	case "decorated_definition":
-		*chunks = append(*chunks, buildDecoratedChunk(filePath, node, source))
+	case "lexical_declaration", "variable_declaration":
+		if hasVariableDeclarator(node) {
+			*chunks = append(*chunks, buildNamedChunk(filePath, node.Kind(), node, source))
+		}
 	}
 
 	cursor := node.Walk()
@@ -61,23 +84,19 @@ func walkNode(filePath string, source []byte, node *tree_sitter.Node, chunks *[]
 	}
 }
 
-func buildNamedChunk(filePath string, kind string, node *tree_sitter.Node, source []byte) syntax.Chunk {
-	name := extractNodeName(node, source)
-	return newChunk(filePath, kind, name, "", node, source)
-}
-
-func buildDecoratedChunk(filePath string, node *tree_sitter.Node, source []byte) syntax.Chunk {
-	kind := "decorated_definition"
-	name := extractNodeName(node, source)
-	if def := node.ChildByFieldName("definition"); def != nil {
-		if def.Kind() != "" {
-			kind = def.Kind()
-		}
-		if candidate := extractNodeName(def, source); candidate != "" {
-			name = candidate
+func hasVariableDeclarator(node *tree_sitter.Node) bool {
+	cursor := node.Walk()
+	defer cursor.Close()
+	for _, child := range node.NamedChildren(cursor) {
+		if child.Kind() == "variable_declarator" {
+			return true
 		}
 	}
-	return newChunk(filePath, kind, name, "", node, source)
+	return false
+}
+
+func buildNamedChunk(filePath string, kind string, node *tree_sitter.Node, source []byte) syntax.Chunk {
+	return newChunk(filePath, kind, extractNodeName(node, source), "", node, source)
 }
 
 func newChunk(filePath string, kind string, name string, parentKey string, node *tree_sitter.Node, source []byte) syntax.Chunk {
@@ -154,8 +173,20 @@ func extractNodeName(node *tree_sitter.Node, source []byte) string {
 	if name := node.ChildByFieldName("name"); name != nil {
 		return strings.TrimSpace(name.Utf8Text(source))
 	}
-	if def := node.ChildByFieldName("definition"); def != nil {
-		if name := def.ChildByFieldName("name"); name != nil {
+	if declaration := node.ChildByFieldName("declaration"); declaration != nil {
+		if name := extractNodeName(declaration, source); name != "" {
+			return name
+		}
+	}
+
+	cursor := node.Walk()
+	defer cursor.Close()
+	for _, child := range node.NamedChildren(cursor) {
+		if child.Kind() != "variable_declarator" {
+			continue
+		}
+		childCopy := child
+		if name := childCopy.ChildByFieldName("name"); name != nil {
 			return strings.TrimSpace(name.Utf8Text(source))
 		}
 	}

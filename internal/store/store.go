@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	chunkEmbeddingDimensions  = 768
-	symbolEmbeddingDimensions = 768
+	chunkEmbeddingDimensions = 384
 )
 
 var sqliteVecAuto sync.Once
@@ -102,14 +101,22 @@ type EdgeData struct {
 	Provenance string
 }
 
+type ChunkSymbolLinkData struct {
+	ChunkKey string
+	Symbol   string
+	Role     string
+	Weight   float64
+}
+
 type IndexPayload struct {
-	Project     ProjectData
-	Files       []FileData
-	Symbols     []SymbolData
-	Occurrences []OccurrenceData
-	Chunks      []ChunkData
-	Edges       []EdgeData
-	Embeddings  []EmbeddingData
+	Project      ProjectData
+	Files        []FileData
+	Symbols      []SymbolData
+	Occurrences  []OccurrenceData
+	Chunks       []ChunkData
+	ChunkSymbols []ChunkSymbolLinkData
+	Edges        []EdgeData
+	Embeddings   []EmbeddingData
 }
 
 type EmbeddingData struct {
@@ -154,6 +161,13 @@ type RelatedChunk struct {
 	HeaderText   string  `json:"header_text"`
 	Text         string  `json:"text"`
 	Score        float64 `json:"score"`
+}
+
+type ChunkSymbolLink struct {
+	ChunkID  int64   `json:"chunk_id"`
+	SymbolID int64   `json:"symbol_id"`
+	Role     string  `json:"role"`
+	Weight   float64 `json:"weight"`
 }
 
 type SearchHit struct {
@@ -313,6 +327,15 @@ func (s *Store) migrate() error {
 			retrieval_text TEXT NOT NULL,
 			UNIQUE(project_id, chunk_key)
 		);`,
+		`CREATE TABLE IF NOT EXISTS chunk_symbols (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+			chunk_id INTEGER NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+			symbol_id INTEGER NOT NULL REFERENCES symbols(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			weight REAL NOT NULL,
+			UNIQUE(project_id, chunk_id, symbol_id, role)
+		);`,
 		`CREATE TABLE IF NOT EXISTS edges (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -336,6 +359,8 @@ func (s *Store) migrate() error {
 		`CREATE INDEX IF NOT EXISTS idx_symbols_project_display ON symbols(project_id, display_name);`,
 		`CREATE INDEX IF NOT EXISTS idx_occurrences_symbol ON occurrences(symbol_id, is_definition);`,
 		`CREATE INDEX IF NOT EXISTS idx_chunks_primary_symbol ON chunks(primary_symbol_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_chunk_symbols_chunk ON chunk_symbols(chunk_id, weight DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_chunk_symbols_symbol ON chunk_symbols(symbol_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_symbol_id, kind);`,
 	}
 
@@ -347,20 +372,34 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(`DROP TABLE IF EXISTS embedding_docs`); err != nil {
 		return fmt.Errorf("drop legacy embedding table: %w", err)
 	}
-	if _, err := s.db.Exec(fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
-		embedding float[%d]
-	)`, chunkEmbeddingDimensions)); err != nil {
-		return fmt.Errorf("create vector table: %w", err)
+	if err := s.ensureVecTable("vec_chunks", chunkEmbeddingDimensions); err != nil {
+		return fmt.Errorf("ensure chunk vector table: %w", err)
 	}
-	if _, err := s.db.Exec(fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS vec_symbols USING vec0(
-		embedding float[%d]
-	)`, symbolEmbeddingDimensions)); err != nil {
-		return fmt.Errorf("create symbol vector table: %w", err)
+	if err := s.ensureVecTable("vec_symbols", chunkEmbeddingDimensions); err != nil {
+		return fmt.Errorf("ensure symbol vector table: %w", err)
 	}
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN adapter_id TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("migrate adapter_id column: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) ensureVecTable(name string, dimensions int) error {
+	var existingSQL string
+	err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&existingSQL)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	expected := fmt.Sprintf("float[%d]", dimensions)
+	if existingSQL != "" && !strings.Contains(existingSQL, expected) {
+		if _, err := s.db.Exec(`DROP TABLE IF EXISTS ` + name); err != nil {
+			return err
+		}
+	}
+	_, err = s.db.Exec(fmt.Sprintf(`CREATE VIRTUAL TABLE IF NOT EXISTS %s USING vec0(
+		embedding float[%d]
+	)`, name, dimensions))
+	return err
 }
 
 func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) error {
@@ -379,9 +418,6 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	if oldErr == nil {
 		if _, err = tx.ExecContext(ctx, `DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE project_id = ?)`, oldProjectID); err != nil {
 			return fmt.Errorf("delete old vector rows: %w", err)
-		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM vec_symbols WHERE rowid IN (SELECT id FROM symbols WHERE project_id = ?)`, oldProjectID); err != nil {
-			return fmt.Errorf("delete old symbol vector rows: %w", err)
 		}
 		if _, err = tx.ExecContext(ctx, `DELETE FROM projects WHERE id = ?`, oldProjectID); err != nil {
 			return fmt.Errorf("delete old project: %w", err)
@@ -581,6 +617,29 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 		}
 	}
 
+	for _, link := range payload.ChunkSymbols {
+		chunkID, ok := chunkIDs[link.ChunkKey]
+		if !ok {
+			continue
+		}
+		symbolID, ok := symbolIDs[link.Symbol]
+		if !ok {
+			continue
+		}
+		if _, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO chunk_symbols (project_id, chunk_id, symbol_id, role, weight)
+			 VALUES (?, ?, ?, ?, ?)`,
+			projectID,
+			chunkID,
+			symbolID,
+			link.Role,
+			link.Weight,
+		); execErr != nil {
+			return fmt.Errorf("insert chunk symbol link %s -> %s: %w", link.ChunkKey, link.Symbol, execErr)
+		}
+	}
+
 	for _, edge := range payload.Edges {
 		srcID, ok := symbolIDs[edge.SrcSymbol]
 		if !ok {
@@ -622,19 +681,6 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 				blob,
 			); execErr != nil {
 				return fmt.Errorf("insert chunk vector for %s: %w", embedding.OwnerKey, execErr)
-			}
-		case "symbol":
-			symbolID, ok := symbolIDs[embedding.OwnerKey]
-			if !ok {
-				continue
-			}
-			if _, execErr := tx.ExecContext(
-				ctx,
-				`INSERT INTO vec_symbols (rowid, embedding) VALUES (?, ?)`,
-				symbolID,
-				blob,
-			); execErr != nil {
-				return fmt.Errorf("insert symbol vector for %s: %w", embedding.OwnerKey, execErr)
 			}
 		}
 	}
@@ -748,9 +794,34 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 		return nil, fmt.Errorf("empty search query")
 	}
 
+	terms := tokenizeSearchTerms(query)
+	args := []any{query, query + "%", "%" + query + "%", "%" + query + "%"}
+
+	var scoreExpr strings.Builder
+	scoreExpr.WriteString(`CASE WHEN c.retrieval_text LIKE '%' || ? || '%' THEN 8.0 ELSE 0.0 END`)
+	scoreExpr.WriteString(` + CASE WHEN c.name LIKE ? THEN 4.0 ELSE 0.0 END`)
+	scoreExpr.WriteString(` + CASE WHEN c.header_text LIKE ? THEN 3.0 ELSE 0.0 END`)
+	scoreExpr.WriteString(` + CASE WHEN c.text LIKE ? THEN 2.0 ELSE 0.0 END`)
+
+	var where strings.Builder
+	where.WriteString(`c.project_id = ? AND (`)
+	where.WriteString(`c.retrieval_text LIKE '%' || ? || '%' OR c.name LIKE ? OR c.header_text LIKE ? OR c.text LIKE ?`)
+	whereArgs := []any{query, query + "%", "%" + query + "%", "%" + query + "%"}
+	for _, term := range terms {
+		scoreExpr.WriteString(` + CASE WHEN c.retrieval_text LIKE '%' || ? || '%' THEN 1.25 ELSE 0.0 END`)
+		scoreExpr.WriteString(` + CASE WHEN c.header_text LIKE '%' || ? || '%' THEN 0.75 ELSE 0.0 END`)
+		args = append(args, term, term)
+		where.WriteString(` OR c.retrieval_text LIKE '%' || ? || '%'`)
+		whereArgs = append(whereArgs, term)
+	}
+	where.WriteString(`)`)
+	args = append(args, projectID)
+	args = append(args, whereArgs...)
+	args = append(args, limit)
+
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT
+		fmt.Sprintf(`SELECT
 			c.id,
 			c.file_id,
 			COALESCE(c.primary_symbol_id, 0),
@@ -761,15 +832,13 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 			c.name,
 			c.header_text,
 			c.text,
-			0.0
+			(%s) AS score
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
-		WHERE c.project_id = ? AND c.retrieval_text LIKE ?
-		ORDER BY c.start_line
-		LIMIT ?`,
-		projectID,
-		"%"+query+"%",
-		limit,
+		WHERE %s
+		ORDER BY score DESC, c.start_line
+		LIMIT ?`, scoreExpr.String(), where.String()),
+		args...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("search chunks: %w", err)
@@ -1042,12 +1111,26 @@ func (s *Store) SemanticSearchSymbols(ctx context.Context, rootPath string, vect
 }
 
 func (s *Store) FindDefinition(ctx context.Context, rootPath string, symbol string) (*DefinitionResult, error) {
+	results, err := s.FindDefinitions(ctx, rootPath, symbol, 1)
+	if err != nil {
+		return nil, err
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+	return &results[0], nil
+}
+
+func (s *Store) FindDefinitions(ctx context.Context, rootPath string, symbol string, limit int) ([]DefinitionResult, error) {
 	projectID, err := s.projectID(ctx, rootPath)
 	if err != nil {
 		return nil, err
 	}
+	if limit <= 0 {
+		limit = 10
+	}
 
-	row := s.db.QueryRowContext(
+	rows, err := s.db.QueryContext(
 		ctx,
 		`SELECT
 			s.id, s.scip_symbol, s.display_name, s.kind,
@@ -1065,8 +1148,11 @@ func (s *Store) FindDefinition(ctx context.Context, rootPath string, symbol stri
 				WHEN s.display_name LIKE ? THEN 2
 				ELSE 3
 			END,
-			LENGTH(s.display_name)
-		LIMIT 1`,
+			CASE WHEN COALESCE(f.abs_path, '') LIKE '%/tests/%' THEN 1 ELSE 0 END,
+			LENGTH(s.display_name),
+			COALESCE(f.abs_path, ''),
+			s.def_start_line
+		LIMIT ?`,
 		projectID,
 		symbol,
 		symbol,
@@ -1074,30 +1160,36 @@ func (s *Store) FindDefinition(ctx context.Context, rootPath string, symbol stri
 		"%"+symbol+"%",
 		symbol,
 		symbol,
-		"%"+symbol+"%",
+		symbol+"%",
+		limit,
 	)
-
-	var result DefinitionResult
-	if err := row.Scan(
-		&result.SymbolID,
-		&result.ScipSymbol,
-		&result.DisplayName,
-		&result.Kind,
-		&result.Path,
-		&result.StartLine,
-		&result.StartCol,
-		&result.EndLine,
-		&result.EndCol,
-		&result.DocSummary,
-		&result.Signature,
-		&result.Enclosing,
-	); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
-		}
-		return nil, fmt.Errorf("find definition: %w", err)
+	if err != nil {
+		return nil, fmt.Errorf("find definitions: %w", err)
 	}
-	return &result, nil
+	defer rows.Close()
+
+	var results []DefinitionResult
+	for rows.Next() {
+		var result DefinitionResult
+		if err := rows.Scan(
+			&result.SymbolID,
+			&result.ScipSymbol,
+			&result.DisplayName,
+			&result.Kind,
+			&result.Path,
+			&result.StartLine,
+			&result.StartCol,
+			&result.EndLine,
+			&result.EndCol,
+			&result.DocSummary,
+			&result.Signature,
+			&result.Enclosing,
+		); err != nil {
+			return nil, fmt.Errorf("scan definition candidate: %w", err)
+		}
+		results = append(results, result)
+	}
+	return results, rows.Err()
 }
 
 func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol string, limit int) ([]ReferenceResult, error) {
@@ -1108,10 +1200,32 @@ func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol stri
 	if def == nil {
 		return nil, nil
 	}
+	return s.ListReferencesBySymbolID(ctx, rootPath, def.SymbolID, limit)
+}
+
+func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, symbolID int64, limit int) ([]ReferenceResult, error) {
+	projectID, err := s.projectID(ctx, rootPath)
+	if err != nil {
+		return nil, err
+	}
+	if limit <= 0 {
+		limit = 10
+	}
 
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT
+		`WITH reference_family(symbol_id) AS (
+			SELECT ?
+			UNION
+			SELECT e.dst_symbol_id
+			FROM edges e
+			WHERE e.project_id = ? AND e.src_symbol_id = ? AND e.kind = 'reference'
+			UNION
+			SELECT e.src_symbol_id
+			FROM edges e
+			WHERE e.project_id = ? AND e.dst_symbol_id = ? AND e.kind = 'reference'
+		)
+		SELECT
 			o.symbol_id,
 			s.display_name,
 			f.abs_path,
@@ -1123,10 +1237,14 @@ func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol stri
 		FROM occurrences o
 		JOIN symbols s ON s.id = o.symbol_id
 		JOIN files f ON f.id = o.file_id
-		WHERE o.symbol_id = ? AND o.is_definition = 0
+		WHERE o.symbol_id IN (SELECT symbol_id FROM reference_family) AND o.is_definition = 0
 		ORDER BY f.abs_path, o.start_line, o.start_col
 		LIMIT ?`,
-		def.SymbolID,
+		symbolID,
+		projectID,
+		symbolID,
+		projectID,
+		symbolID,
 		limit,
 	)
 	if err != nil {
@@ -1152,6 +1270,24 @@ func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol stri
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
+}
+
+func tokenizeSearchTerms(query string) []string {
+	fields := strings.Fields(strings.ToLower(query))
+	out := make([]string, 0, len(fields))
+	seen := make(map[string]struct{}, len(fields))
+	for _, field := range fields {
+		term := strings.Trim(field, " \t\r\n.,:;!?()[]{}<>\"'`")
+		if len(term) < 3 {
+			continue
+		}
+		if _, ok := seen[term]; ok {
+			continue
+		}
+		seen[term] = struct{}{}
+		out = append(out, term)
+	}
+	return out
 }
 
 func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID int64) (*SearchHit, error) {
@@ -1194,6 +1330,47 @@ func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID i
 		return nil, fmt.Errorf("definition chunk: %w", err)
 	}
 	return &hit, nil
+}
+
+func (s *Store) LinkedSymbolsForChunks(ctx context.Context, rootPath string, chunkIDs []int64) ([]ChunkSymbolLink, error) {
+	projectID, err := s.projectID(ctx, rootPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(chunkIDs) == 0 {
+		return nil, nil
+	}
+
+	placeholders := make([]string, 0, len(chunkIDs))
+	args := make([]any, 0, len(chunkIDs)+1)
+	args = append(args, projectID)
+	for _, chunkID := range chunkIDs {
+		placeholders = append(placeholders, "?")
+		args = append(args, chunkID)
+	}
+
+	rows, err := s.db.QueryContext(
+		ctx,
+		fmt.Sprintf(`SELECT chunk_id, symbol_id, role, weight
+		FROM chunk_symbols
+		WHERE project_id = ? AND chunk_id IN (%s)
+		ORDER BY chunk_id, weight DESC, symbol_id`, strings.Join(placeholders, ",")),
+		args...,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("linked chunk symbols: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ChunkSymbolLink
+	for rows.Next() {
+		var link ChunkSymbolLink
+		if err := rows.Scan(&link.ChunkID, &link.SymbolID, &link.Role, &link.Weight); err != nil {
+			return nil, fmt.Errorf("scan linked chunk symbol: %w", err)
+		}
+		out = append(out, link)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int64, excludeChunkID int64, limit int) ([]SearchHit, error) {

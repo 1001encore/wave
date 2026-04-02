@@ -1,13 +1,24 @@
 package embed
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	_ "embed"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 type ONNXProvider struct {
@@ -15,36 +26,92 @@ type ONNXProvider struct {
 	ScriptPath string
 	ModelDir   string
 	ModelName  string
+	Device     string
+	lastStats  Stats
 }
 
 type onnxRequest struct {
-	ModelDir string   `json:"model_dir"`
-	Texts    []string `json:"texts"`
+	ModelDir  string   `json:"model_dir"`
+	Texts     []string `json:"texts"`
+	BatchSize int      `json:"batch_size"`
+	Device    string   `json:"device,omitempty"`
 }
 
-type onnxResponse struct {
-	Embeddings [][]float32 `json:"embeddings"`
+type onnxResponseHeader struct {
+	Count          int     `json:"count"`
+	Dim            int     `json:"dim"`
+	Provider       string  `json:"provider"`
+	RequestedBatch int     `json:"requested_batch"`
+	SelectedBatch  int     `json:"selected_batch"`
+	BatchCount     int     `json:"batch_count"`
+	OOMRetries     int     `json:"oom_retries"`
+	RequestMS      float64 `json:"request_ms"`
+	PreloadMS      float64 `json:"preload_ms"`
+	SessionMS      float64 `json:"session_ms"`
+	TokenizeMS     float64 `json:"tokenize_ms"`
+	InferMS        float64 `json:"infer_ms"`
+	NormalizeMS    float64 `json:"normalize_ms"`
+	SerializeMS    float64 `json:"serialize_ms"`
+	TotalMS        float64 `json:"total_ms"`
 }
 
-func (p ONNXProvider) Name() string {
+type onnxBatchStat struct {
+	Index        int     `json:"index"`
+	Size         int     `json:"size"`
+	Processed    int     `json:"processed"`
+	TokenizeMS   float64 `json:"tokenize_ms"`
+	InferMS      float64 `json:"infer_ms"`
+	NormalizeMS  float64 `json:"normalize_ms"`
+	RetryCount   int     `json:"retry_count"`
+	SettledBatch int     `json:"settled_batch"`
+}
+
+const (
+	embedModelName  = "all-MiniLM-L6-v2"
+	embedModelRepo  = "optimum/all-MiniLM-L6-v2"
+	embedModelEnv   = "WAVE_EMBED_MODEL_DIR"
+	embedCacheEnv   = "WAVE_EMBED_CACHE_DIR"
+	embedPythonEnv  = "WAVE_EMBED_PYTHON"
+	embedBatchEnv   = "WAVE_EMBED_BATCH_SIZE"
+	embedScriptName = "embed_onnx.py"
+)
+
+var embedModelFiles = []string{
+	"config.json",
+	"tokenizer.json",
+	"tokenizer_config.json",
+	"special_tokens_map.json",
+	"vocab.txt",
+	"README.md",
+	"model.onnx",
+}
+
+//go:embed assets/embed_onnx.py
+var embeddedONNXScript []byte
+
+func (p *ONNXProvider) Name() string {
 	if p.ModelName != "" {
 		return p.ModelName
 	}
 	return "onnx"
 }
 
-func (p ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, error) {
+func (p *ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, error) {
 	if len(docs) == 0 {
+		p.lastStats = Stats{}
 		return nil, nil
 	}
 
+	requestedBatch := embedBatchSize()
 	texts := make([]string, 0, len(docs))
 	for _, doc := range docs {
 		texts = append(texts, doc.Text)
 	}
 	payload, err := json.Marshal(onnxRequest{
-		ModelDir: p.ModelDir,
-		Texts:    texts,
+		ModelDir:  p.ModelDir,
+		Texts:     texts,
+		BatchSize: requestedBatch,
+		Device:    p.Device,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal embedding request: %w", err)
@@ -55,59 +122,202 @@ func (p ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, err
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("run onnx embedder: %w\n%s", err, stderr.String())
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, fmt.Errorf("create onnx stderr pipe: %w", err)
+	}
+	startedAt := time.Now()
+	if err := cmd.Start(); err != nil {
+		return nil, fmt.Errorf("start onnx embedder: %w", err)
 	}
 
-	var response onnxResponse
-	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
-		return nil, fmt.Errorf("decode embedding response: %w", err)
+	var stderrWG sync.WaitGroup
+	stderrWG.Add(1)
+	go func() {
+		defer stderrWG.Done()
+		readONNXStderr(stderrPipe, &stderr)
+	}()
+
+	if err := cmd.Wait(); err != nil {
+		stderrWG.Wait()
+		_, cleanStderr := parseONNXStderr(stderr.Bytes())
+		return nil, fmt.Errorf("run onnx embedder: %w\n%s", err, cleanStderr)
 	}
-	if len(response.Embeddings) != len(docs) {
-		return nil, fmt.Errorf("embedding count mismatch: got %d want %d", len(response.Embeddings), len(docs))
+	stderrWG.Wait()
+	decodeStartedAt := time.Now()
+	batchStats, _ := parseONNXStderr(stderr.Bytes())
+
+	header, payloadBytes, err := decodeONNXResponse(stdout.Bytes())
+	if err != nil {
+		return nil, err
+	}
+	if header.Count != len(docs) {
+		return nil, fmt.Errorf("embedding count mismatch: got %d want %d", header.Count, len(docs))
+	}
+	if header.Dim <= 0 {
+		return nil, fmt.Errorf("invalid embedding dimension: %d", header.Dim)
+	}
+	expectedBytes := header.Count * header.Dim * 4
+	if len(payloadBytes) != expectedBytes {
+		return nil, fmt.Errorf("embedding payload size mismatch: got %d want %d", len(payloadBytes), expectedBytes)
+	}
+
+	flat := make([]float32, header.Count*header.Dim)
+	for i := range flat {
+		offset := i * 4
+		flat[i] = math.Float32frombits(binary.LittleEndian.Uint32(payloadBytes[offset : offset+4]))
 	}
 
 	vectors := make([]Vector, 0, len(docs))
 	for i, doc := range docs {
+		start := i * header.Dim
+		end := start + header.Dim
 		vectors = append(vectors, Vector{
 			OwnerType: doc.OwnerType,
 			OwnerKey:  doc.OwnerKey,
-			Values:    response.Embeddings[i],
+			Values:    flat[start:end],
 		})
+	}
+	p.lastStats = Stats{
+		Provider:       header.Provider,
+		RequestedBatch: requestedBatch,
+		SelectedBatch:  header.SelectedBatch,
+		BatchCount:     header.BatchCount,
+		OOMRetries:     header.OOMRetries,
+		Documents:      header.Count,
+		Dimensions:     header.Dim,
+		RequestMS:      header.RequestMS,
+		PreloadMS:      header.PreloadMS,
+		SessionMS:      header.SessionMS,
+		TokenizeMS:     header.TokenizeMS,
+		InferMS:        header.InferMS,
+		NormalizeMS:    header.NormalizeMS,
+		SerializeMS:    header.SerializeMS,
+		DecodeMS:       float64(time.Since(decodeStartedAt)) / float64(time.Millisecond),
+		TotalMS:        maxFloat64(header.TotalMS, float64(time.Since(startedAt))/float64(time.Millisecond)),
+		BatchStats:     batchStats,
 	}
 	return vectors, nil
 }
 
-func ResolveONNXProvider(rootDir string) Provider {
+func (p *ONNXProvider) LastStats() Stats {
+	return p.lastStats
+}
+
+func readONNXStderr(r io.Reader, dst *bytes.Buffer) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		dst.WriteString(line)
+		dst.WriteByte('\n')
+		if stat, ok := parseONNXBatchLine(line); ok {
+			fmt.Fprintf(
+				os.Stderr,
+				"embed_batch #%d size=%d processed=%d tokenize=%.1f infer=%.1f normalize=%.1f retries=%d settled=%d\n",
+				stat.Index,
+				stat.Size,
+				stat.Processed,
+				stat.TokenizeMS,
+				stat.InferMS,
+				stat.NormalizeMS,
+				stat.RetryCount,
+				stat.SettledBatch,
+			)
+		}
+	}
+}
+
+func decodeONNXResponse(stdout []byte) (onnxResponseHeader, []byte, error) {
+	newline := bytes.IndexByte(stdout, '\n')
+	if newline < 0 {
+		return onnxResponseHeader{}, nil, fmt.Errorf("decode embedding response: missing header")
+	}
+
+	var header onnxResponseHeader
+	if err := json.Unmarshal(stdout[:newline], &header); err != nil {
+		return onnxResponseHeader{}, nil, fmt.Errorf("decode embedding response header: %w", err)
+	}
+	return header, stdout[newline+1:], nil
+}
+
+func embedBatchSize() int {
+	if value := strings.TrimSpace(os.Getenv(embedBatchEnv)); value != "" {
+		n, err := strconv.Atoi(value)
+		if err != nil {
+			return 0
+		}
+		if n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func parseONNXStderr(stderr []byte) ([]BatchStats, string) {
+	lines := strings.Split(strings.ReplaceAll(string(stderr), "\r\n", "\n"), "\n")
+	batches := make([]BatchStats, 0, len(lines))
+	other := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if item, ok := parseONNXBatchLine(line); ok {
+			batches = append(batches, item)
+			continue
+		}
+		other = append(other, line)
+	}
+	return batches, strings.Join(other, "\n")
+}
+
+func parseONNXBatchLine(line string) (BatchStats, bool) {
+	const prefix = "WAVE_EMBED_BATCH "
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, prefix) {
+		return BatchStats{}, false
+	}
+	var item onnxBatchStat
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &item); err != nil {
+		return BatchStats{}, false
+	}
+	return BatchStats{
+		Index:        item.Index,
+		Size:         item.Size,
+		Processed:    item.Processed,
+		TokenizeMS:   item.TokenizeMS,
+		InferMS:      item.InferMS,
+		NormalizeMS:  item.NormalizeMS,
+		RetryCount:   item.RetryCount,
+		SettledBatch: item.SettledBatch,
+	}, true
+}
+
+func ResolveONNXProvider(rootDir string, device string) (Provider, error) {
 	searchRoots := candidateRoots(rootDir)
-	modelDir := firstExistingDir(
-		append([]string{os.Getenv("WAVE_EMBED_MODEL_DIR")}, rootedPath(searchRoots, ".wave", "models", "CodeRankEmbed-onnx-int8")...)...,
-	)
-	if modelDir == "" {
-		return NoopProvider{}
+	modelDir, err := resolveModelDir(searchRoots)
+	if err != nil {
+		return nil, err
 	}
 
-	pythonPath := firstExistingFile(
-		rootedPath(searchRoots, ".venv", "bin", "python")...,
-	)
-	if pythonPath == "" {
-		return NoopProvider{}
+	pythonPath, err := resolvePythonPath(searchRoots)
+	if err != nil {
+		return nil, err
 	}
 
-	scriptPath := firstExistingFile(
-		rootedPath(searchRoots, "scripts", "embed_onnx.py")...,
-	)
-	if scriptPath == "" {
-		return NoopProvider{}
+	scriptPath, err := ensureEmbeddedScript()
+	if err != nil {
+		return nil, err
 	}
 
-	return ONNXProvider{
+	return &ONNXProvider{
 		PythonPath: pythonPath,
 		ScriptPath: scriptPath,
 		ModelDir:   modelDir,
-		ModelName:  "CodeRankEmbed-onnx-int8",
-	}
+		ModelName:  embedModelName,
+		Device:     device,
+	}, nil
 }
 
 func candidateRoots(rootDir string) []string {
@@ -166,4 +376,236 @@ func firstExistingFile(paths ...string) string {
 		}
 	}
 	return ""
+}
+
+func resolveModelDir(searchRoots []string) (string, error) {
+	if override := strings.TrimSpace(os.Getenv(embedModelEnv)); override != "" {
+		if !dirExists(override) {
+			return "", fmt.Errorf("%s is set but directory does not exist: %s", embedModelEnv, override)
+		}
+		if err := ensureModelFiles(filepath.Clean(override)); err != nil {
+			return "", err
+		}
+		return filepath.Clean(override), nil
+	}
+
+	candidates := append(
+		rootedPath(searchRoots, ".wave", "models", embedModelName),
+		defaultModelDir(),
+	)
+	for _, candidate := range candidates {
+		if candidate == "" || !dirExists(candidate) {
+			continue
+		}
+		if err := ensureModelFiles(candidate); err != nil {
+			return "", err
+		}
+		return candidate, nil
+	}
+
+	target := defaultModelDir()
+	if target == "" {
+		return "", fmt.Errorf("cannot resolve model cache directory")
+	}
+	if err := downloadModel(target); err != nil {
+		return "", err
+	}
+	return target, nil
+}
+
+func resolvePythonPath(searchRoots []string) (string, error) {
+	if override := strings.TrimSpace(os.Getenv(embedPythonEnv)); override != "" {
+		if !fileExists(override) {
+			return "", fmt.Errorf("%s is set but file does not exist: %s", embedPythonEnv, override)
+		}
+		if err := ensurePythonDeps(override); err != nil {
+			return "", err
+		}
+		return filepath.Clean(override), nil
+	}
+
+	if path := firstExistingFile(rootedPath(searchRoots, ".venv", "bin", "python")...); path != "" {
+		if err := ensurePythonDeps(path); err == nil {
+			return path, nil
+		}
+	}
+	if path, err := exec.LookPath("python3"); err == nil {
+		if err := ensurePythonDeps(path); err == nil {
+			return path, nil
+		}
+		return ensureEmbeddedRuntime(path)
+	}
+	if path, err := exec.LookPath("python"); err == nil {
+		if err := ensurePythonDeps(path); err == nil {
+			return path, nil
+		}
+		return ensureEmbeddedRuntime(path)
+	}
+	return "", fmt.Errorf("python runtime not found; expected project .venv/bin/python or python3 on PATH")
+}
+
+func ensureEmbeddedScript() (string, error) {
+	cacheDir, err := userCacheDir()
+	if err != nil {
+		return "", err
+	}
+	scriptDir := filepath.Join(cacheDir, "scripts")
+	if err := os.MkdirAll(scriptDir, 0o755); err != nil {
+		return "", fmt.Errorf("create embed script directory: %w", err)
+	}
+
+	scriptPath := filepath.Join(scriptDir, embedScriptName)
+	if existing, err := os.ReadFile(scriptPath); err == nil {
+		if sha256.Sum256(existing) == sha256.Sum256(embeddedONNXScript) {
+			return scriptPath, nil
+		}
+	}
+
+	tmpPath := scriptPath + ".tmp"
+	if err := os.WriteFile(tmpPath, embeddedONNXScript, 0o755); err != nil {
+		return "", fmt.Errorf("write embedded onnx script: %w", err)
+	}
+	if err := os.Rename(tmpPath, scriptPath); err != nil {
+		return "", fmt.Errorf("install embedded onnx script: %w", err)
+	}
+	return scriptPath, nil
+}
+
+func ensureModelFiles(modelDir string) error {
+	for _, rel := range embedModelFiles {
+		path := filepath.Join(modelDir, rel)
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() {
+			return fmt.Errorf("embedding model is incomplete; missing %s", path)
+		}
+	}
+	return nil
+}
+
+func downloadModel(modelDir string) error {
+	if err := os.MkdirAll(modelDir, 0o755); err != nil {
+		return fmt.Errorf("create model directory: %w", err)
+	}
+
+	client := &http.Client{}
+	for _, rel := range embedModelFiles {
+		targetPath := filepath.Join(modelDir, rel)
+		if info, err := os.Stat(targetPath); err == nil && !info.IsDir() {
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
+			return fmt.Errorf("create model subdirectory for %s: %w", rel, err)
+		}
+		if err := downloadFile(client, modelURL(rel), targetPath); err != nil {
+			return fmt.Errorf("download %s: %w", rel, err)
+		}
+	}
+	return ensureModelFiles(modelDir)
+}
+
+func downloadFile(client *http.Client, url string, targetPath string) error {
+	resp, err := client.Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status %d from %s", resp.StatusCode, url)
+	}
+
+	tmpPath := targetPath + ".tmp"
+	out, err := os.Create(tmpPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, resp.Body); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, targetPath)
+}
+
+func modelURL(rel string) string {
+	return fmt.Sprintf("https://huggingface.co/%s/resolve/main/%s?download=1", embedModelRepo, rel)
+}
+
+func defaultModelDir() string {
+	cacheDir, err := userCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(cacheDir, "models", embedModelName)
+}
+
+func userCacheDir() (string, error) {
+	if override := strings.TrimSpace(os.Getenv(embedCacheEnv)); override != "" {
+		return filepath.Clean(override), nil
+	}
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user cache dir: %w", err)
+	}
+	return filepath.Join(dir, "wave"), nil
+}
+
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
+}
+
+func fileExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir()
+}
+
+func maxFloat64(a float64, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func ensurePythonDeps(pythonPath string) error {
+	cmd := exec.Command(pythonPath, "-c", "import numpy, onnxruntime, tokenizers")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("python runtime %s is missing embedding dependencies: %s", pythonPath, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func ensureEmbeddedRuntime(basePython string) (string, error) {
+	cacheDir, err := userCacheDir()
+	if err != nil {
+		return "", err
+	}
+	runtimeDir := filepath.Join(cacheDir, "runtime")
+	runtimePython := filepath.Join(runtimeDir, "bin", "python")
+
+	if fileExists(runtimePython) {
+		if err := ensurePythonDeps(runtimePython); err == nil {
+			return runtimePython, nil
+		}
+	}
+
+	if !dirExists(runtimeDir) {
+		cmd := exec.Command(basePython, "-m", "venv", runtimeDir)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("create embedding runtime: %w\n%s", err, strings.TrimSpace(string(output)))
+		}
+	}
+
+	cmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "numpy", "onnxruntime", "tokenizers")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("install embedding runtime dependencies: %w\n%s", err, strings.TrimSpace(string(output)))
+	}
+	if err := ensurePythonDeps(runtimePython); err != nil {
+		return "", err
+	}
+	return runtimePython, nil
 }

@@ -8,8 +8,8 @@ import (
 	"strings"
 	"sync"
 
-	"wave/internal/embed"
-	"wave/internal/store"
+	"github.com/1001encore/wave/internal/embed"
+	"github.com/1001encore/wave/internal/store"
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_./:#()\-]*$`)
@@ -40,15 +40,17 @@ type SearchResult struct {
 }
 
 type DefinitionResult struct {
-	Plan       Plan                    `json:"plan"`
-	Definition *store.DefinitionResult `json:"definition,omitempty"`
-	Chunk      *store.SearchHit        `json:"chunk,omitempty"`
+	Plan       Plan                     `json:"plan"`
+	Definition *store.DefinitionResult  `json:"definition,omitempty"`
+	Chunk      *store.SearchHit         `json:"chunk,omitempty"`
+	Candidates []store.DefinitionResult `json:"candidates,omitempty"`
 }
 
 type ReferencesResult struct {
-	Plan       Plan                    `json:"plan"`
-	Definition *store.DefinitionResult `json:"definition,omitempty"`
-	References []store.ReferenceResult `json:"references,omitempty"`
+	Plan       Plan                     `json:"plan"`
+	Definition *store.DefinitionResult  `json:"definition,omitempty"`
+	References []store.ReferenceResult  `json:"references,omitempty"`
+	Candidates []store.DefinitionResult `json:"candidates,omitempty"`
 }
 
 type ContextResult struct {
@@ -61,11 +63,10 @@ type ContextResult struct {
 }
 
 type querySignals struct {
-	exactDef        *store.DefinitionResult
-	lexicalSymbols  []store.SymbolSearchHit
-	semanticSymbols []store.SymbolSearchHit
-	lexicalChunks   []store.SearchHit
-	semanticChunks  []store.SearchHit
+	exactDef       *store.DefinitionResult
+	lexicalSymbols []store.SymbolSearchHit
+	lexicalChunks  []store.SearchHit
+	semanticChunks []store.SearchHit
 }
 
 type searchCandidate struct {
@@ -142,13 +143,17 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 }
 
 func (r *Router) Definition(ctx context.Context, rootPath string, symbol string) (DefinitionResult, error) {
-	def, err := r.store.FindDefinition(ctx, rootPath, symbol)
+	candidates, err := r.store.FindDefinitions(ctx, rootPath, symbol, 8)
 	if err != nil {
 		return DefinitionResult{}, err
 	}
+	def, ambiguous := resolveDefinition(symbol, candidates)
 	result := DefinitionResult{
 		Plan:       Plan{Mode: "exact_symbol_lookup", Reason: "definition queries route directly to symbol lookup"},
 		Definition: def,
+	}
+	if ambiguous {
+		result.Candidates = candidates
 	}
 	if def != nil {
 		chunk, chunkErr := r.store.DefinitionChunk(ctx, rootPath, def.SymbolID)
@@ -160,24 +165,33 @@ func (r *Router) Definition(ctx context.Context, rootPath string, symbol string)
 }
 
 func (r *Router) References(ctx context.Context, rootPath string, symbol string, limit int) (ReferencesResult, error) {
-	def, err := r.store.FindDefinition(ctx, rootPath, symbol)
+	candidates, err := r.store.FindDefinitions(ctx, rootPath, symbol, 8)
 	if err != nil {
 		return ReferencesResult{}, err
 	}
+	def, ambiguous := resolveDefinition(symbol, candidates)
 	if def == nil {
-		return ReferencesResult{
+		result := ReferencesResult{
 			Plan: Plan{Mode: "graph_reference_lookup", Reason: "references queries route to the occurrence graph"},
-		}, nil
+		}
+		if ambiguous {
+			result.Candidates = candidates
+		}
+		return result, nil
 	}
-	refs, err := r.store.ListReferences(ctx, rootPath, symbol, limit)
+	refs, err := r.store.ListReferencesBySymbolID(ctx, rootPath, def.SymbolID, limit)
 	if err != nil {
 		return ReferencesResult{}, err
 	}
-	return ReferencesResult{
+	result := ReferencesResult{
 		Plan:       Plan{Mode: "graph_reference_lookup", Reason: "references queries route to the occurrence graph"},
 		Definition: def,
 		References: refs,
-	}, nil
+	}
+	if ambiguous {
+		result.Candidates = candidates
+	}
+	return result, nil
 }
 
 func (r *Router) Context(ctx context.Context, rootPath string, query string, limit int, mode QueryMode) (ContextResult, error) {
@@ -189,7 +203,7 @@ func (r *Router) Context(ctx context.Context, rootPath string, query string, lim
 		return ContextResult{Plan: searchResult.Plan}, nil
 	}
 
-	seed := searchResult.Hits[0]
+	seed := chooseContextSeed(searchResult.Hits, query)
 	result := ContextResult{
 		Plan: searchResult.Plan,
 		Seed: &seed,
@@ -211,17 +225,18 @@ func (r *Router) Context(ctx context.Context, rootPath string, query string, lim
 	if seed.Name != "" {
 		symbolQuery = seed.Name
 	}
-	if seed.PrimarySymbolID > 0 || isIdentifierLike(symbolQuery) {
+	if seed.ChunkID > 0 || isIdentifierLike(symbolQuery) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if seed.PrimarySymbolID > 0 {
-				related, _ = r.store.RelatedChunks(ctx, rootPath, seed.PrimarySymbolID, min(6, limit))
+			if seed.ChunkID > 0 {
+				related = r.relatedChunksForSeedChunk(ctx, rootPath, seed.ChunkID, limit)
 			}
 			if isIdentifierLike(symbolQuery) {
-				def, _ = r.store.FindDefinition(ctx, rootPath, symbolQuery)
+				candidates, _ := r.store.FindDefinitions(ctx, rootPath, symbolQuery, 8)
+				def, _ = resolveDefinition(symbolQuery, candidates)
 				if def != nil {
-					refs, _ = r.store.ListReferences(ctx, rootPath, def.DisplayName, limit)
+					refs, _ = r.store.ListReferencesBySymbolID(ctx, rootPath, def.SymbolID, limit)
 					if len(related) == 0 {
 						related, _ = r.store.RelatedChunks(ctx, rootPath, def.SymbolID, min(6, limit))
 					}
@@ -267,14 +282,18 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 	var exactErr error
 	var lexicalSymbolErr error
 	var lexicalChunkErr error
-	var semanticSymbolErr error
 	var semanticChunkErr error
 
 	if opts.exactSymbols {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			signals.exactDef, exactErr = r.store.FindDefinition(ctx, rootPath, query)
+			candidates, err := r.store.FindDefinitions(ctx, rootPath, query, 8)
+			if err != nil {
+				exactErr = err
+				return
+			}
+			signals.exactDef, _ = resolveDefinition(query, candidates)
 		}()
 	}
 	if opts.lexicalSymbols {
@@ -309,14 +328,10 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 			}
 
 			var semanticWG sync.WaitGroup
-			semanticWG.Add(2)
+			semanticWG.Add(1)
 			go func() {
 				defer semanticWG.Done()
 				signals.semanticChunks, semanticChunkErr = r.store.SemanticSearchChunks(ctx, rootPath, vectors[0].Values, limit)
-			}()
-			go func() {
-				defer semanticWG.Done()
-				signals.semanticSymbols, semanticSymbolErr = r.store.SemanticSearchSymbols(ctx, rootPath, vectors[0].Values, limit)
 			}()
 			semanticWG.Wait()
 		}()
@@ -334,9 +349,6 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 	}
 	if semanticChunkErr != nil {
 		return querySignals{}, semanticChunkErr
-	}
-	if semanticSymbolErr != nil {
-		return querySignals{}, semanticSymbolErr
 	}
 	return signals, nil
 }
@@ -386,15 +398,19 @@ func (r *Router) rankSearchHits(ctx context.Context, rootPath string, query stri
 		boost := 70 * hit.Score * rankWeight(i)
 		addDefinitionChunk(hit.SymbolID, boost)
 	}
-	for i, hit := range signals.semanticSymbols {
-		boost := 80 * similarityFromDistance(hit.Score) * rankWeight(i)
-		addDefinitionChunk(hit.SymbolID, boost)
-	}
 	for i, hit := range signals.lexicalChunks {
 		addChunk(hit, 28*rankWeight(i))
 	}
 	for i, hit := range signals.semanticChunks {
 		addChunk(hit, 55*similarityFromDistance(hit.Score)*rankWeight(i))
+	}
+
+	for _, link := range r.chunkSeedLinks(ctx, rootPath, candidates, 6) {
+		boost := link.Weight
+		if boost <= 0 {
+			continue
+		}
+		seedSymbols[link.SymbolID] = maxFloat(seedSymbols[link.SymbolID], boost)
 	}
 
 	if opts.graphExpand {
@@ -424,6 +440,7 @@ func (r *Router) rankSearchHits(ctx context.Context, rootPath string, query stri
 	ranked := make([]store.SearchHit, 0, len(candidates))
 	for _, item := range candidates {
 		item.hit.Score = item.score
+		item.hit.Score = rerankChunkScore(item.hit, item.score)
 		ranked = append(ranked, item.hit)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
@@ -439,6 +456,103 @@ func (r *Router) rankSearchHits(ctx context.Context, rootPath string, query stri
 		ranked = ranked[:limit]
 	}
 	return ranked, nil
+}
+
+func (r *Router) chunkSeedLinks(ctx context.Context, rootPath string, candidates map[int64]*searchCandidate, limit int) []store.ChunkSymbolLink {
+	if len(candidates) == 0 || limit <= 0 {
+		return nil
+	}
+
+	type scoredChunk struct {
+		ChunkID int64
+		Score   float64
+	}
+
+	chunks := make([]scoredChunk, 0, len(candidates))
+	for chunkID, candidate := range candidates {
+		chunks = append(chunks, scoredChunk{
+			ChunkID: chunkID,
+			Score:   candidate.score,
+		})
+	}
+	sort.SliceStable(chunks, func(i, j int) bool {
+		if chunks[i].Score == chunks[j].Score {
+			return chunks[i].ChunkID < chunks[j].ChunkID
+		}
+		return chunks[i].Score > chunks[j].Score
+	})
+	if len(chunks) > limit {
+		chunks = chunks[:limit]
+	}
+
+	chunkIDs := make([]int64, 0, len(chunks))
+	chunkScores := make(map[int64]float64, len(chunks))
+	for _, chunk := range chunks {
+		chunkIDs = append(chunkIDs, chunk.ChunkID)
+		chunkScores[chunk.ChunkID] = chunk.Score
+	}
+
+	links, err := r.store.LinkedSymbolsForChunks(ctx, rootPath, chunkIDs)
+	if err != nil {
+		return nil
+	}
+	for i := range links {
+		links[i].Weight *= normalizedSeedWeight(chunkScores[links[i].ChunkID]) * roleWeight(links[i].Role)
+	}
+	return links
+}
+
+func (r *Router) relatedChunksForSeedChunk(ctx context.Context, rootPath string, chunkID int64, limit int) []store.RelatedChunk {
+	if chunkID == 0 || limit <= 0 {
+		return nil
+	}
+	links, err := r.store.LinkedSymbolsForChunks(ctx, rootPath, []int64{chunkID})
+	if err != nil || len(links) == 0 {
+		return nil
+	}
+
+	type symbolSeed struct {
+		SymbolID int64
+		Weight   float64
+	}
+
+	weights := map[int64]float64{}
+	for _, link := range links {
+		weights[link.SymbolID] = maxFloat(weights[link.SymbolID], link.Weight*roleWeight(link.Role))
+	}
+	seeds := make([]symbolSeed, 0, len(weights))
+	for symbolID, weight := range weights {
+		seeds = append(seeds, symbolSeed{SymbolID: symbolID, Weight: weight})
+	}
+	sort.SliceStable(seeds, func(i, j int) bool {
+		if seeds[i].Weight == seeds[j].Weight {
+			return seeds[i].SymbolID < seeds[j].SymbolID
+		}
+		return seeds[i].Weight > seeds[j].Weight
+	})
+	if len(seeds) > 4 {
+		seeds = seeds[:4]
+	}
+
+	seen := map[int64]struct{}{}
+	related := make([]store.RelatedChunk, 0, limit)
+	for _, seed := range seeds {
+		chunks, err := r.store.RelatedChunks(ctx, rootPath, seed.SymbolID, min(6, limit))
+		if err != nil {
+			continue
+		}
+		for _, chunk := range chunks {
+			if _, ok := seen[chunk.ChunkID]; ok {
+				continue
+			}
+			seen[chunk.ChunkID] = struct{}{}
+			related = append(related, chunk)
+			if len(related) >= limit {
+				return related
+			}
+		}
+	}
+	return related
 }
 
 func normalizeMode(mode QueryMode) (QueryMode, error) {
@@ -473,8 +587,20 @@ func graphWeight(kind string, direction string) float64 {
 	switch kind {
 	case "calls":
 		weight = 1.0
+	case "reference":
+		weight = 0.95
+	case "implementation":
+		weight = 0.9
+	case "type_definition":
+		weight = 0.8
 	case "imports":
 		weight = 0.55
+	case "writes":
+		weight = 0.7
+	case "reads":
+		weight = 0.65
+	case "uses":
+		weight = 0.6
 	case "contains":
 		weight = 0.4
 	default:
@@ -484,6 +610,23 @@ func graphWeight(kind string, direction string) float64 {
 		return weight
 	}
 	return weight * 0.9
+}
+
+func roleWeight(role string) float64 {
+	switch role {
+	case "defines":
+		return 1.0
+	case "writes":
+		return 0.8
+	case "reads":
+		return 0.7
+	case "imports":
+		return 0.65
+	case "uses":
+		return 0.6
+	default:
+		return 0.5
+	}
 }
 
 type weightedSymbol struct {
@@ -542,4 +685,117 @@ func maxFloat(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+func resolveDefinition(query string, candidates []store.DefinitionResult) (*store.DefinitionResult, bool) {
+	if len(candidates) == 0 {
+		return nil, false
+	}
+
+	var exact []store.DefinitionResult
+	for _, candidate := range candidates {
+		if candidate.DisplayName == query || candidate.ScipSymbol == query {
+			exact = append(exact, candidate)
+		}
+	}
+	if len(exact) == 1 {
+		return &exact[0], false
+	}
+	if len(exact) > 1 {
+		best := rankDefinitionCandidates(exact)
+		return &best, true
+	}
+	if len(candidates) == 1 {
+		return &candidates[0], false
+	}
+	best := rankDefinitionCandidates(candidates)
+	return &best, true
+}
+
+func rankDefinitionCandidates(candidates []store.DefinitionResult) store.DefinitionResult {
+	best := candidates[0]
+	bestScore := definitionSpecificity(best)
+	for _, c := range candidates[1:] {
+		score := definitionSpecificity(c)
+		if score > bestScore {
+			best = c
+			bestScore = score
+		}
+	}
+	return best
+}
+
+func definitionSpecificity(d store.DefinitionResult) float64 {
+	score := 0.0
+	if d.Path != "" {
+		score += 10.0
+	}
+	switch d.Kind {
+	case "function", "method":
+		score += 5.0
+	case "class":
+		score += 4.0
+	case "interface":
+		score += 3.5
+	case "type", "type_alias":
+		score += 3.0
+	case "variable", "property":
+		score += 2.0
+	case "module":
+		score += 1.0
+	}
+	if d.DocSummary != "" {
+		score += 1.0
+	}
+	span := (d.EndLine - d.StartLine) + 1
+	if span > 0 {
+		score += 1.0 / float64(span)
+	}
+	return score
+}
+
+func chooseContextSeed(hits []store.SearchHit, query string) store.SearchHit {
+	best := hits[0]
+	bestScore := contextSeedScore(best, query)
+	for _, hit := range hits[1:] {
+		score := contextSeedScore(hit, query)
+		if score > bestScore {
+			best = hit
+			bestScore = score
+		}
+	}
+	return best
+}
+
+func contextSeedScore(hit store.SearchHit, query string) float64 {
+	score := rerankChunkScore(hit, hit.Score)
+	switch hit.Kind {
+	case "function_definition", "method_definition", "class_definition", "interface_declaration", "class_declaration":
+		score *= 1.3
+	case "module":
+		score *= 0.22
+	case "import_statement", "import_from_statement":
+		score *= 0.35
+	}
+	if isIdentifierLike(query) && hit.Name == query {
+		score *= 1.6
+	}
+	return score
+}
+
+func rerankChunkScore(hit store.SearchHit, base float64) float64 {
+	score := base
+	lineSpan := max(1, hit.EndLine-hit.StartLine+1)
+	switch hit.Kind {
+	case "module":
+		score *= 0.3
+	case "import_statement", "import_from_statement":
+		score *= 0.45
+	case "function_definition", "method_definition", "class_definition", "class_declaration", "interface_declaration":
+		score *= 1.15
+	}
+	if lineSpan > 40 {
+		score *= 40.0 / float64(lineSpan)
+	}
+	return score
 }

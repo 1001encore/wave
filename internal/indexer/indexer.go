@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"wave/internal/store"
-	"wave/internal/syntax"
-	"wave/internal/workspace"
+	"github.com/1001encore/wave/internal/store"
+	"github.com/1001encore/wave/internal/syntax"
+	"github.com/1001encore/wave/internal/workspace"
 )
 
 type Result struct {

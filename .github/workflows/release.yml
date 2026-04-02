@@ -1,0 +1,115 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset_os: linux
+            goarch: amd64
+            exe: ""
+            archive: tar.gz
+          - os: ubuntu-latest
+            asset_os: linux
+            goarch: arm64
+            exe: ""
+            archive: tar.gz
+          - os: macos-13
+            asset_os: darwin
+            goarch: amd64
+            exe: ""
+            archive: tar.gz
+          - os: macos-latest
+            asset_os: darwin
+            goarch: arm64
+            exe: ""
+            archive: tar.gz
+          - os: windows-latest
+            asset_os: windows
+            goarch: amd64
+            exe: .exe
+            archive: zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - if: matrix.asset_os == 'windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: mingw-w64-x86_64-gcc
+
+      - name: Install cross-compiler (linux/arm64)
+        if: matrix.asset_os == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+
+      - name: Test
+        if: matrix.goarch == 'amd64' || matrix.asset_os == 'darwin'
+        shell: bash
+        run: go test ./...
+
+      - name: Build
+        shell: bash
+        env:
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+          CC: ${{ matrix.asset_os == 'linux' && matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/wave${{ matrix.exe }}" ./cmd/wave
+
+      - name: Package tarball
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          tar -C dist -czf "dist/wave_${{ matrix.asset_os }}_${{ matrix.goarch }}.tar.gz" "wave${{ matrix.exe }}"
+
+      - name: Package zip
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/wave.exe -DestinationPath "dist/wave_windows_${{ matrix.goarch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wave-${{ matrix.asset_os }}-${{ matrix.goarch }}
+          path: dist/wave_${{ matrix.asset_os }}_${{ matrix.goarch }}.${{ matrix.archive }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum * > wave_checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*

@@ -1,4 +1,4 @@
-package python
+package typescript
 
 import (
 	"context"
@@ -6,7 +6,6 @@ import (
 	"sort"
 
 	tree_sitter "github.com/tree-sitter/go-tree-sitter"
-	tree_sitter_python "github.com/tree-sitter/tree-sitter-python/bindings/go"
 
 	"github.com/1001encore/wave/internal/indexer"
 	"github.com/1001encore/wave/internal/store"
@@ -87,37 +86,6 @@ func deriveEdges(ctx context.Context, req indexer.DeriveRequest) ([]store.EdgeDa
 	return edges, nil
 }
 
-func enclosingSymbolForOccurrence(filePath string, occ store.OccurrenceData, chunks []store.ChunkData) string {
-	bestWidth := 0
-	bestSymbol := ""
-	for _, chunk := range chunks {
-		if chunk.FilePath != filePath || chunk.PrimarySymbol == "" {
-			continue
-		}
-		if chunk.Kind == "import_statement" || chunk.Kind == "import_from_statement" {
-			continue
-		}
-		if !rangeWithin(
-			occ.EnclosingStartLine,
-			occ.EnclosingStartCol,
-			occ.EnclosingEndLine,
-			occ.EnclosingEndCol,
-			chunk.StartLine,
-			chunk.StartCol,
-			chunk.EndLine,
-			chunk.EndCol,
-		) {
-			continue
-		}
-		width := (chunk.EndLine-chunk.StartLine)*100000 + (chunk.EndCol - chunk.StartCol)
-		if bestSymbol == "" || width < bestWidth {
-			bestSymbol = chunk.PrimarySymbol
-			bestWidth = width
-		}
-	}
-	return bestSymbol
-}
-
 func deriveCallEdges(
 	ctx context.Context,
 	filePath string,
@@ -128,9 +96,9 @@ func deriveCallEdges(
 	parser := tree_sitter.NewParser()
 	defer parser.Close()
 
-	lang := tree_sitter.NewLanguage(tree_sitter_python.Language())
+	lang := tree_sitter.NewLanguage(languageForFile(filePath))
 	if err := parser.SetLanguage(lang); err != nil {
-		return nil, fmt.Errorf("set python grammar: %w", err)
+		return nil, fmt.Errorf("set typescript grammar: %w", err)
 	}
 	tree := parser.ParseCtx(ctx, source, nil)
 	if tree == nil {
@@ -149,7 +117,7 @@ func deriveCallEdges(
 		if node == nil {
 			return
 		}
-		if node.Kind() == "call" || node.Kind() == "decorator" {
+		if node.Kind() == "call_expression" || node.Kind() == "new_expression" {
 			src := enclosingSymbolForNode(filePath, node, chunks)
 			dst := calleeSymbolForNode(node, occurrences)
 			if src != "" && dst != "" {
@@ -173,6 +141,37 @@ func deriveCallEdges(
 	return edges, nil
 }
 
+func enclosingSymbolForOccurrence(filePath string, occ store.OccurrenceData, chunks []store.ChunkData) string {
+	bestWidth := 0
+	bestSymbol := ""
+	for _, chunk := range chunks {
+		if chunk.FilePath != filePath || chunk.PrimarySymbol == "" {
+			continue
+		}
+		if chunk.Kind == "import_statement" {
+			continue
+		}
+		if !rangeWithin(
+			occ.EnclosingStartLine,
+			occ.EnclosingStartCol,
+			occ.EnclosingEndLine,
+			occ.EnclosingEndCol,
+			chunk.StartLine,
+			chunk.StartCol,
+			chunk.EndLine,
+			chunk.EndCol,
+		) {
+			continue
+		}
+		width := (chunk.EndLine-chunk.StartLine)*100000 + (chunk.EndCol - chunk.StartCol)
+		if bestSymbol == "" || width < bestWidth {
+			bestSymbol = chunk.PrimarySymbol
+			bestWidth = width
+		}
+	}
+	return bestSymbol
+}
+
 func enclosingSymbolForNode(filePath string, node *tree_sitter.Node, chunks []store.ChunkData) string {
 	start := node.StartPosition()
 	end := node.EndPosition()
@@ -182,7 +181,8 @@ func enclosingSymbolForNode(filePath string, node *tree_sitter.Node, chunks []st
 		if chunk.FilePath != filePath || chunk.PrimarySymbol == "" {
 			continue
 		}
-		if chunk.Kind == "import_statement" || chunk.Kind == "import_from_statement" {
+		switch chunk.Kind {
+		case "import_statement", "interface_declaration", "type_alias_declaration", "enum_declaration", "public_field_definition", "method_signature", "abstract_method_signature":
 			continue
 		}
 		if chunk.StartLine > int(start.Row) || chunk.EndLine < int(end.Row) {
@@ -199,6 +199,9 @@ func enclosingSymbolForNode(filePath string, node *tree_sitter.Node, chunks []st
 
 func calleeSymbolForNode(node *tree_sitter.Node, occurrences []store.OccurrenceData) string {
 	functionNode := node.ChildByFieldName("function")
+	if functionNode == nil {
+		functionNode = node.ChildByFieldName("constructor")
+	}
 	if functionNode == nil {
 		functionNode = node
 	}
