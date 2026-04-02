@@ -54,7 +54,7 @@ jobs:
         with:
           msystem: MINGW64
           update: true
-          install: mingw-w64-x86_64-gcc
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-sqlite3
 
       - name: Install cross-compiler (linux/arm64)
         if: matrix.asset_os == 'linux' && matrix.goarch == 'arm64'
@@ -63,11 +63,21 @@ jobs:
           sudo apt-get install -y -qq gcc-aarch64-linux-gnu
 
       - name: Test
-        if: matrix.goarch == 'amd64' || matrix.asset_os == 'darwin'
+        if: (matrix.goarch == 'amd64' || matrix.asset_os == 'darwin') && matrix.asset_os != 'windows'
         shell: bash
         run: go test ./...
 
+      - name: Test (Windows)
+        if: matrix.asset_os == 'windows'
+        shell: bash
+        run: |
+          export PATH="/c/msys64/mingw64/bin:$PATH"
+          export CGO_CFLAGS="-I/c/msys64/mingw64/include"
+          export CGO_LDFLAGS="-L/c/msys64/mingw64/lib"
+          go test ./...
+
       - name: Build
+        if: matrix.asset_os != 'windows'
         shell: bash
         env:
           GOARCH: ${{ matrix.goarch }}
@@ -76,6 +86,17 @@ jobs:
         run: |
           mkdir -p dist
           go build -trimpath -ldflags "-s -w" -o "dist/wave${{ matrix.exe }}" ./cmd/wave
+
+      - name: Build (Windows)
+        if: matrix.asset_os == 'windows'
+        shell: bash
+        run: |
+          export PATH="/c/msys64/mingw64/bin:$PATH"
+          export CGO_ENABLED=1
+          export CGO_CFLAGS="-I/c/msys64/mingw64/include"
+          export CGO_LDFLAGS="-L/c/msys64/mingw64/lib"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w" -o "dist/wave.exe" ./cmd/wave
 
       - name: Package tarball
         if: matrix.archive == 'tar.gz'
