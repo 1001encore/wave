@@ -251,7 +251,7 @@ func (s *Store) migrate() error {
 		`PRAGMA foreign_keys = ON;`,
 		`CREATE TABLE IF NOT EXISTS projects (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			root_path TEXT NOT NULL UNIQUE,
+			root_path TEXT NOT NULL,
 			name TEXT NOT NULL,
 			language TEXT NOT NULL,
 			manifest_path TEXT NOT NULL,
@@ -260,7 +260,8 @@ func (s *Store) migrate() error {
 			scip_artifact_path TEXT NOT NULL,
 			tool_name TEXT NOT NULL,
 			tool_version TEXT NOT NULL,
-			last_indexed_at TEXT NOT NULL
+			last_indexed_at TEXT NOT NULL,
+			UNIQUE(root_path, adapter_id)
 		);`,
 		`CREATE TABLE IF NOT EXISTS files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -381,6 +382,9 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN adapter_id TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("migrate adapter_id column: %w", err)
 	}
+	if err := s.migrateLegacyProjectUniqueness(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -402,7 +406,73 @@ func (s *Store) ensureVecTable(name string, dimensions int) error {
 	return err
 }
 
+func (s *Store) migrateLegacyProjectUniqueness() error {
+	var sqlText string
+	err := s.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'projects'`).Scan(&sqlText)
+	if err != nil {
+		return fmt.Errorf("inspect projects schema: %w", err)
+	}
+	lower := strings.ToLower(sqlText)
+	if !strings.Contains(lower, "root_path text not null unique") {
+		return nil
+	}
+
+	if _, err := s.db.Exec(`PRAGMA foreign_keys = OFF;`); err != nil {
+		return fmt.Errorf("disable foreign keys: %w", err)
+	}
+	defer func() {
+		_, _ = s.db.Exec(`PRAGMA foreign_keys = ON;`)
+	}()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin projects migration tx: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	stmts := []string{
+		`CREATE TABLE projects_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			root_path TEXT NOT NULL,
+			name TEXT NOT NULL,
+			language TEXT NOT NULL,
+			manifest_path TEXT NOT NULL,
+			environment_source TEXT NOT NULL,
+			adapter_id TEXT NOT NULL DEFAULT '',
+			scip_artifact_path TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			tool_version TEXT NOT NULL,
+			last_indexed_at TEXT NOT NULL,
+			UNIQUE(root_path, adapter_id)
+		);`,
+		`INSERT INTO projects_new (
+			id, root_path, name, language, manifest_path, environment_source, adapter_id,
+			scip_artifact_path, tool_name, tool_version, last_indexed_at
+		)
+		SELECT
+			id, root_path, name, language, manifest_path, environment_source, adapter_id,
+			scip_artifact_path, tool_name, tool_version, last_indexed_at
+		FROM projects;`,
+		`DROP TABLE projects;`,
+		`ALTER TABLE projects_new RENAME TO projects;`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("migrate projects uniqueness: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit projects migration: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) error {
+	cleanRoot := filepath.Clean(payload.Project.RootPath)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin transaction: %w", err)
@@ -414,7 +484,12 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	}()
 
 	var oldProjectID int64
-	oldErr := tx.QueryRowContext(ctx, `SELECT id FROM projects WHERE root_path = ?`, payload.Project.RootPath).Scan(&oldProjectID)
+	oldErr := tx.QueryRowContext(
+		ctx,
+		`SELECT id FROM projects WHERE root_path = ? AND adapter_id = ?`,
+		cleanRoot,
+		payload.Project.AdapterID,
+	).Scan(&oldProjectID)
 	if oldErr == nil {
 		if _, err = tx.ExecContext(ctx, `DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE project_id = ?)`, oldProjectID); err != nil {
 			return fmt.Errorf("delete old vector rows: %w", err)
@@ -433,7 +508,7 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 			root_path, name, language, manifest_path, environment_source, adapter_id, scip_artifact_path,
 			tool_name, tool_version, last_indexed_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		payload.Project.RootPath,
+		cleanRoot,
 		payload.Project.Name,
 		payload.Project.Language,
 		payload.Project.ManifestPath,
@@ -708,6 +783,67 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	return nil
 }
 
+func (s *Store) DeleteProjectsExceptAdapters(ctx context.Context, rootPath string, adapterIDs []string) error {
+	cleanRoot := filepath.Clean(rootPath)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	var (
+		filter strings.Builder
+		args   []any
+	)
+	filter.WriteString(`root_path = ?`)
+	args = append(args, cleanRoot)
+	if len(adapterIDs) > 0 {
+		filter.WriteString(` AND adapter_id NOT IN (`)
+		for i, adapterID := range adapterIDs {
+			if i > 0 {
+				filter.WriteString(",")
+			}
+			filter.WriteString("?")
+			args = append(args, adapterID)
+		}
+		filter.WriteString(")")
+	}
+
+	deleteVecChunksSQL := fmt.Sprintf(
+		`DELETE FROM vec_chunks WHERE rowid IN (
+			SELECT id FROM chunks WHERE project_id IN (SELECT id FROM projects WHERE %s)
+		)`,
+		filter.String(),
+	)
+	if _, err = tx.ExecContext(ctx, deleteVecChunksSQL, args...); err != nil {
+		return fmt.Errorf("delete stale chunk vectors: %w", err)
+	}
+
+	deleteVecSymbolsSQL := fmt.Sprintf(
+		`DELETE FROM vec_symbols WHERE rowid IN (
+			SELECT id FROM symbols WHERE project_id IN (SELECT id FROM projects WHERE %s)
+		)`,
+		filter.String(),
+	)
+	if _, err = tx.ExecContext(ctx, deleteVecSymbolsSQL, args...); err != nil {
+		return fmt.Errorf("delete stale symbol vectors: %w", err)
+	}
+
+	deleteProjectsSQL := fmt.Sprintf(`DELETE FROM projects WHERE %s`, filter.String())
+	if _, err = tx.ExecContext(ctx, deleteProjectsSQL, args...); err != nil {
+		return fmt.Errorf("delete stale projects: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit stale project delete: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) Status(ctx context.Context, rootPath string) ([]StatusRow, error) {
 	query := `
 		SELECT
@@ -728,7 +864,7 @@ func (s *Store) Status(ctx context.Context, rootPath string) ([]StatusRow, error
 		query += ` WHERE p.root_path = ?`
 		args = append(args, filepath.Clean(rootPath))
 	}
-	query += ` ORDER BY p.root_path`
+	query += ` ORDER BY p.root_path, p.adapter_id`
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -760,13 +896,23 @@ func (s *Store) Status(ctx context.Context, rootPath string) ([]StatusRow, error
 	return result, rows.Err()
 }
 
-func (s *Store) IndexedFiles(ctx context.Context, rootPath string) (map[string]IndexedFileRow, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+func (s *Store) IndexedFiles(ctx context.Context, rootPath string, adapterID string) (map[string]IndexedFileRow, error) {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
-	rows, err := s.db.QueryContext(ctx, `SELECT relative_path, abs_path, content_hash FROM files WHERE project_id = ?`, projectID)
+	query := `SELECT f.relative_path, f.abs_path, f.content_hash
+		FROM files f
+		JOIN projects p ON p.id = f.project_id
+		WHERE p.root_path = ?`
+	args := []any{cleanRoot}
+	if strings.TrimSpace(adapterID) != "" {
+		query += ` AND p.adapter_id = ?`
+		args = append(args, adapterID)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query indexed files: %w", err)
 	}
@@ -784,8 +930,8 @@ func (s *Store) IndexedFiles(ctx context.Context, rootPath string) (map[string]I
 }
 
 func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string, limit int) ([]SearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -804,9 +950,9 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 	scoreExpr.WriteString(` + CASE WHEN c.text LIKE ? THEN 2.0 ELSE 0.0 END`)
 
 	var where strings.Builder
-	where.WriteString(`c.project_id = ? AND (`)
+	where.WriteString(`c.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND (`)
 	where.WriteString(`c.retrieval_text LIKE '%' || ? || '%' OR c.name LIKE ? OR c.header_text LIKE ? OR c.text LIKE ?`)
-	whereArgs := []any{query, query + "%", "%" + query + "%", "%" + query + "%"}
+	whereArgs := []any{cleanRoot, query, query + "%", "%" + query + "%", "%" + query + "%"}
 	for _, term := range terms {
 		scoreExpr.WriteString(` + CASE WHEN c.retrieval_text LIKE '%' || ? || '%' THEN 1.25 ELSE 0.0 END`)
 		scoreExpr.WriteString(` + CASE WHEN c.header_text LIKE '%' || ? || '%' THEN 0.75 ELSE 0.0 END`)
@@ -815,7 +961,6 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 		whereArgs = append(whereArgs, term)
 	}
 	where.WriteString(`)`)
-	args = append(args, projectID)
 	args = append(args, whereArgs...)
 	args = append(args, limit)
 
@@ -869,8 +1014,8 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 }
 
 func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vector []float32, limit int) ([]SearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -905,12 +1050,12 @@ func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vecto
 		FROM knn
 		JOIN chunks c ON c.id = knn.chunk_id
 		JOIN files f ON f.id = c.file_id
-		WHERE c.project_id = ?
+		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 		ORDER BY knn.distance, c.start_line
 		LIMIT ?`,
 		queryBlob,
 		limit,
-		projectID,
+		cleanRoot,
 		limit,
 	)
 	if err != nil {
@@ -942,8 +1087,8 @@ func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vecto
 }
 
 func (s *Store) SearchSymbols(ctx context.Context, rootPath string, query string, limit int) ([]SymbolSearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -978,7 +1123,7 @@ func (s *Store) SearchSymbols(ctx context.Context, rootPath string, query string
 			END AS score
 		FROM symbols s
 		LEFT JOIN files f ON f.id = s.file_id
-		WHERE s.project_id = ? AND (
+		WHERE s.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND (
 			s.display_name = ? OR
 			s.scip_symbol = ? OR
 			s.display_name LIKE ? OR
@@ -994,7 +1139,7 @@ func (s *Store) SearchSymbols(ctx context.Context, rootPath string, query string
 		"%"+query+"%",
 		"%"+query+"%",
 		"%"+query+"%",
-		projectID,
+		cleanRoot,
 		query,
 		query,
 		query+"%",
@@ -1034,8 +1179,8 @@ func (s *Store) SearchSymbols(ctx context.Context, rootPath string, query string
 }
 
 func (s *Store) SemanticSearchSymbols(ctx context.Context, rootPath string, vector []float32, limit int) ([]SymbolSearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -1072,12 +1217,12 @@ func (s *Store) SemanticSearchSymbols(ctx context.Context, rootPath string, vect
 		FROM knn
 		JOIN symbols s ON s.id = knn.symbol_id
 		LEFT JOIN files f ON f.id = s.file_id
-		WHERE s.project_id = ?
+		WHERE s.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 		ORDER BY knn.distance, s.display_name
 		LIMIT ?`,
 		queryBlob,
 		limit,
-		projectID,
+		cleanRoot,
 		limit,
 	)
 	if err != nil {
@@ -1122,8 +1267,8 @@ func (s *Store) FindDefinition(ctx context.Context, rootPath string, symbol stri
 }
 
 func (s *Store) FindDefinitions(ctx context.Context, rootPath string, symbol string, limit int) ([]DefinitionResult, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -1138,7 +1283,7 @@ func (s *Store) FindDefinitions(ctx context.Context, rootPath string, symbol str
 			s.doc_summary, s.signature, s.enclosing_symbol
 		FROM symbols s
 		LEFT JOIN files f ON f.id = s.file_id
-		WHERE s.project_id = ? AND (
+		WHERE s.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND (
 			s.display_name = ? OR s.scip_symbol = ? OR s.display_name LIKE ? OR s.scip_symbol LIKE ?
 		)
 		ORDER BY
@@ -1153,7 +1298,7 @@ func (s *Store) FindDefinitions(ctx context.Context, rootPath string, symbol str
 			COALESCE(f.abs_path, ''),
 			s.def_start_line
 		LIMIT ?`,
-		projectID,
+		cleanRoot,
 		symbol,
 		symbol,
 		"%"+symbol+"%",
@@ -1204,8 +1349,8 @@ func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol stri
 }
 
 func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, symbolID int64, limit int) ([]ReferenceResult, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 	if limit <= 0 {
@@ -1219,11 +1364,11 @@ func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, s
 			UNION
 			SELECT e.dst_symbol_id
 			FROM edges e
-			WHERE e.project_id = ? AND e.src_symbol_id = ? AND e.kind = 'reference'
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.src_symbol_id = ? AND e.kind = 'reference'
 			UNION
 			SELECT e.src_symbol_id
 			FROM edges e
-			WHERE e.project_id = ? AND e.dst_symbol_id = ? AND e.kind = 'reference'
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.dst_symbol_id = ? AND e.kind = 'reference'
 		)
 		SELECT
 			o.symbol_id,
@@ -1241,9 +1386,9 @@ func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, s
 		ORDER BY f.abs_path, o.start_line, o.start_col
 		LIMIT ?`,
 		symbolID,
-		projectID,
+		cleanRoot,
 		symbolID,
-		projectID,
+		cleanRoot,
 		symbolID,
 		limit,
 	)
@@ -1291,8 +1436,8 @@ func tokenizeSearchTerms(query string) []string {
 }
 
 func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID int64) (*SearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -1303,10 +1448,10 @@ func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID i
 			c.start_line, c.end_line, c.kind, c.name, c.header_text, c.text, 0.0
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
-		WHERE c.project_id = ? AND c.primary_symbol_id = ?
+		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND c.primary_symbol_id = ?
 		ORDER BY c.start_line
 		LIMIT 1`,
-		projectID,
+		cleanRoot,
 		symbolID,
 	)
 
@@ -1333,8 +1478,8 @@ func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID i
 }
 
 func (s *Store) LinkedSymbolsForChunks(ctx context.Context, rootPath string, chunkIDs []int64) ([]ChunkSymbolLink, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 	if len(chunkIDs) == 0 {
@@ -1343,7 +1488,7 @@ func (s *Store) LinkedSymbolsForChunks(ctx context.Context, rootPath string, chu
 
 	placeholders := make([]string, 0, len(chunkIDs))
 	args := make([]any, 0, len(chunkIDs)+1)
-	args = append(args, projectID)
+	args = append(args, cleanRoot)
 	for _, chunkID := range chunkIDs {
 		placeholders = append(placeholders, "?")
 		args = append(args, chunkID)
@@ -1353,7 +1498,7 @@ func (s *Store) LinkedSymbolsForChunks(ctx context.Context, rootPath string, chu
 		ctx,
 		fmt.Sprintf(`SELECT chunk_id, symbol_id, role, weight
 		FROM chunk_symbols
-		WHERE project_id = ? AND chunk_id IN (%s)
+		WHERE project_id IN (SELECT id FROM projects WHERE root_path = ?) AND chunk_id IN (%s)
 		ORDER BY chunk_id, weight DESC, symbol_id`, strings.Join(placeholders, ",")),
 		args...,
 	)
@@ -1374,8 +1519,8 @@ func (s *Store) LinkedSymbolsForChunks(ctx context.Context, rootPath string, chu
 }
 
 func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int64, excludeChunkID int64, limit int) ([]SearchHit, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -1386,12 +1531,12 @@ func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int6
 			c.start_line, c.end_line, c.kind, c.name, c.header_text, c.text, 0.0
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
-		WHERE c.project_id = ? AND c.file_id = ? AND c.id != ?
+		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND c.file_id = ? AND c.id != ?
 		ORDER BY ABS(c.start_line - (
 			SELECT start_line FROM chunks WHERE id = ?
 		)), c.start_line
 		LIMIT ?`,
-		projectID,
+		cleanRoot,
 		fileID,
 		excludeChunkID,
 		excludeChunkID,
@@ -1426,8 +1571,8 @@ func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int6
 }
 
 func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int64, limit int) ([]RelatedChunk, error) {
-	projectID, err := s.projectID(ctx, rootPath)
-	if err != nil {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
 	}
 
@@ -1452,7 +1597,7 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 			FROM edges e
 			JOIN chunks c ON c.primary_symbol_id = e.dst_symbol_id
 			JOIN files f ON f.id = c.file_id
-			WHERE e.project_id = ? AND e.src_symbol_id = ? AND c.project_id = ?
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.src_symbol_id = ? AND c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 			UNION ALL
 			SELECT
 				e.kind AS relation_kind,
@@ -1471,12 +1616,12 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 			FROM edges e
 			JOIN chunks c ON c.primary_symbol_id = e.src_symbol_id
 			JOIN files f ON f.id = c.file_id
-			WHERE e.project_id = ? AND e.dst_symbol_id = ? AND c.project_id = ?
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.dst_symbol_id = ? AND c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 		)
 		ORDER BY relation_kind, direction, path, start_line
 		LIMIT ?`,
-		projectID, symbolID, projectID,
-		projectID, symbolID, projectID,
+		cleanRoot, symbolID, cleanRoot,
+		cleanRoot, symbolID, cleanRoot,
 		limit,
 	)
 	if err != nil {
@@ -1515,16 +1660,15 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 	return result, rows.Err()
 }
 
-func (s *Store) projectID(ctx context.Context, rootPath string) (int64, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id FROM projects WHERE root_path = ?`, filepath.Clean(rootPath))
-	var projectID int64
-	if err := row.Scan(&projectID); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, fmt.Errorf("project %s is not indexed", rootPath)
-		}
-		return 0, fmt.Errorf("lookup project: %w", err)
+func (s *Store) ensureProjectsExist(ctx context.Context, rootPath string) error {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(1) FROM projects WHERE root_path = ?`, filepath.Clean(rootPath)).Scan(&count); err != nil {
+		return fmt.Errorf("lookup project: %w", err)
 	}
-	return projectID, nil
+	if count == 0 {
+		return fmt.Errorf("project %s is not indexed", rootPath)
+	}
+	return nil
 }
 
 func boolToInt(v bool) int {

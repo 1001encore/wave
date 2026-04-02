@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -9,8 +10,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 
@@ -40,6 +43,32 @@ type defOccurrence struct {
 	FilePath string
 	Symbol   string
 	Range    scipgraph.Range
+}
+
+type indexUnitSummary struct {
+	Language    string
+	AdapterID   string
+	Artifact    string
+	Files       int
+	Symbols     int
+	Occurrences int
+	Chunks      int
+	Edges       int
+	Embeddings  int
+}
+
+type indexTotals struct {
+	Files       int
+	Symbols     int
+	Occurrences int
+	Chunks      int
+	Edges       int
+	Embeddings  int
+}
+
+type indexerInstallSpec struct {
+	Binary     string
+	NPMPackage string
 }
 
 const (
@@ -115,9 +144,9 @@ func runStatus(ctx context.Context, args []string) int {
 		}
 		root = cwd
 	}
-	_, unit, detectErr := indexer.DetectUnit(adapters(), root)
-	if detectErr == nil && unit.RootPath != "" {
-		root = unit.RootPath
+	detectedRoot, _, detectErr := detectWorkspaceUnits(root)
+	if detectErr == nil && detectedRoot != "" {
+		root = detectedRoot
 	}
 
 	paths, err := config.Resolve(root, cc.dbPath)
@@ -131,8 +160,8 @@ func runStatus(ctx context.Context, args []string) int {
 	defer st.Close()
 
 	rows, err := st.Status(ctx, "")
-	if detectErr == nil && unit.RootPath != "" {
-		rows, err = st.Status(ctx, unit.RootPath)
+	if detectErr == nil && detectedRoot != "" {
+		rows, err = st.Status(ctx, detectedRoot)
 	}
 	if err != nil {
 		return fail(err)
@@ -241,23 +270,22 @@ func runSearch(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 
-	adapter, unit, paths, st, err := openUnitStore(cc)
+	rootPath, units, _, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return fail(err)
 	}
-	_ = paths
 	defer st.Close()
 
-	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
+	embedder, err := embed.ResolveONNXProvider(rootPath, cc.device)
 	if err != nil {
 		return fail(err)
 	}
 	router := queryrouter.NewRouter(st, embedder)
-	result, err := router.Search(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
+	result, err := router.Search(ctx, rootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
 	}
-	printFreshnessWarning(ctx, st, adapter, unit, cc)
+	printFreshnessWarning(ctx, st, units, cc)
 	if cc.jsonOut {
 		if cc.explain {
 			printJSON(result)
@@ -285,7 +313,6 @@ func runSearch(ctx context.Context, args []string) int {
 			hit.Kind,
 			firstNonEmpty(hit.Name, hit.HeaderText),
 		)
-		fmt.Printf("   score: %.3f\n", hit.Score)
 		snippet := truncate(hit.HeaderText, 200)
 		if snippet != "" {
 			fmt.Printf("   code: %s\n", snippet)
@@ -308,18 +335,18 @@ func runDef(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 
-	adapter, unit, _, st, err := openUnitStore(cc)
+	rootPath, units, _, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return fail(err)
 	}
 	defer st.Close()
 
 	router := queryrouter.NewRouter(st, embed.NoopProvider{})
-	result, err := router.Definition(ctx, unit.RootPath, symbol)
+	result, err := router.Definition(ctx, rootPath, symbol)
 	if err != nil {
 		return fail(err)
 	}
-	printFreshnessWarning(ctx, st, adapter, unit, cc)
+	printFreshnessWarning(ctx, st, units, cc)
 	if result.Definition == nil {
 		if len(result.Candidates) > 0 {
 			if cc.jsonOut {
@@ -383,18 +410,18 @@ func runRefs(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 
-	adapter, unit, _, st, err := openUnitStore(cc)
+	rootPath, units, _, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return fail(err)
 	}
 	defer st.Close()
 
 	router := queryrouter.NewRouter(st, embed.NoopProvider{})
-	result, err := router.References(ctx, unit.RootPath, symbol, cc.limit)
+	result, err := router.References(ctx, rootPath, symbol, cc.limit)
 	if err != nil {
 		return fail(err)
 	}
-	printFreshnessWarning(ctx, st, adapter, unit, cc)
+	printFreshnessWarning(ctx, st, units, cc)
 	if result.Definition == nil && len(result.Candidates) > 0 {
 		if cc.jsonOut {
 			if cc.explain {
@@ -460,22 +487,22 @@ func runContext(ctx context.Context, args []string) int {
 		return fail(err)
 	}
 
-	adapter, unit, _, st, err := openUnitStore(cc)
+	rootPath, units, _, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return fail(err)
 	}
 	defer st.Close()
 
-	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
+	embedder, err := embed.ResolveONNXProvider(rootPath, cc.device)
 	if err != nil {
 		return fail(err)
 	}
 	router := queryrouter.NewRouter(st, embedder)
-	result, err := router.Context(ctx, unit.RootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
+	result, err := router.Context(ctx, rootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
 	if err != nil {
 		return fail(err)
 	}
-	printFreshnessWarning(ctx, st, adapter, unit, cc)
+	printFreshnessWarning(ctx, st, units, cc)
 	if result.Seed == nil {
 		return fail(fmt.Errorf("no context seeds found for %q", query))
 	}
@@ -559,102 +586,279 @@ func bindCommonFlags(fs *flag.FlagSet) *commandContext {
 	fs.IntVar(&cc.limit, "limit", 10, "result limit")
 	fs.BoolVar(&cc.explain, "explain", false, "include routing and freshness details")
 	fs.StringVar(&cc.mode, "mode", "auto", "query mode: auto, hybrid, symbol, semantic, graph")
-	fs.StringVar(&cc.device, "device", "", "embedding device: cpu, cuda (default: auto-detect)")
+	fs.StringVar(&cc.device, "device", "cuda", "embedding device: cpu, cuda (default: cuda)")
 	return cc
 }
 
-func openUnitStore(cc *commandContext) (indexer.Adapter, workspace.Unit, config.Paths, *store.Store, error) {
-	adapter, unit, err := indexer.DetectUnit(adapters(), cc.rootPath)
+func detectWorkspaceUnits(start string) (string, []indexer.DetectedUnit, error) {
+	detected, err := indexer.DetectUnits(adapters(), start)
 	if err != nil {
-		return nil, workspace.Unit{}, config.Paths{}, nil, err
+		return "", nil, err
+	}
+	if len(detected) == 0 {
+		return "", nil, fmt.Errorf("no supported workspace unit found from %s", start)
 	}
 
-	paths, err := config.Resolve(unit.RootPath, cc.dbPath)
+	rootCounts := map[string]int{}
+	for _, item := range detected {
+		rootCounts[item.Unit.RootPath]++
+	}
+	bestRoot := detected[0].Unit.RootPath
+	bestCount := rootCounts[bestRoot]
+	for _, item := range detected[1:] {
+		root := item.Unit.RootPath
+		count := rootCounts[root]
+		if count > bestCount || (count == bestCount && len(root) < len(bestRoot)) {
+			bestRoot = root
+			bestCount = count
+		}
+	}
+
+	selected := make([]indexer.DetectedUnit, 0, bestCount)
+	for _, item := range detected {
+		if item.Unit.RootPath == bestRoot {
+			selected = append(selected, item)
+		}
+	}
+	if len(selected) == 0 {
+		return "", nil, fmt.Errorf("no supported workspace unit found from %s", start)
+	}
+	return bestRoot, selected, nil
+}
+
+func openWorkspaceStore(cc *commandContext) (string, []indexer.DetectedUnit, config.Paths, *store.Store, error) {
+	rootPath, units, err := detectWorkspaceUnits(cc.rootPath)
 	if err != nil {
-		return nil, workspace.Unit{}, config.Paths{}, nil, err
+		return "", nil, config.Paths{}, nil, err
+	}
+
+	paths, err := config.Resolve(rootPath, cc.dbPath)
+	if err != nil {
+		return "", nil, config.Paths{}, nil, err
 	}
 
 	st, err := store.Open(paths.DBPath)
 	if err != nil {
-		return nil, workspace.Unit{}, config.Paths{}, nil, err
+		return "", nil, config.Paths{}, nil, err
 	}
 
-	return adapter, unit, paths, st, nil
+	return rootPath, units, paths, st, nil
+}
+
+func artifactSuffix(adapterID string) string {
+	adapterID = strings.TrimSpace(strings.ToLower(adapterID))
+	if adapterID == "" {
+		return "workspace"
+	}
+	var b strings.Builder
+	for _, r := range adapterID {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	value := strings.Trim(b.String(), "_")
+	if value == "" {
+		return "workspace"
+	}
+	return value
+}
+
+func indexerInstallSpecForAdapter(adapterID string) (indexerInstallSpec, bool) {
+	switch strings.TrimSpace(strings.ToLower(adapterID)) {
+	case "python-scip":
+		return indexerInstallSpec{
+			Binary:     "scip-python",
+			NPMPackage: "@sourcegraph/scip-python",
+		}, true
+	case "typescript-scip":
+		return indexerInstallSpec{
+			Binary:     "scip-typescript",
+			NPMPackage: "@sourcegraph/scip-typescript",
+		}, true
+	default:
+		return indexerInstallSpec{}, false
+	}
+}
+
+func ensureIndexerDependencies(ctx context.Context, units []indexer.DetectedUnit, jsonOut bool) error {
+	seen := map[string]struct{}{}
+	plans := make([]indexerInstallSpec, 0, len(units))
+	for _, item := range units {
+		spec, ok := indexerInstallSpecForAdapter(item.Adapter.ID())
+		if !ok {
+			continue
+		}
+		key := spec.Binary + "\x00" + spec.NPMPackage
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		plans = append(plans, spec)
+	}
+
+	for _, plan := range plans {
+		if _, err := exec.LookPath(plan.Binary); err == nil {
+			continue
+		}
+		if _, err := exec.LookPath("npm"); err != nil {
+			return fmt.Errorf(
+				"%s is required but not found, and npm is unavailable to install it: %w",
+				plan.Binary,
+				err,
+			)
+		}
+		if !jsonOut {
+			fmt.Fprintf(os.Stderr, "info: %s not found; installing %s via npm\n", plan.Binary, plan.NPMPackage)
+		}
+		cmd := exec.CommandContext(ctx, "npm", "install", "-g", plan.NPMPackage)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return fmt.Errorf(
+				"install %s (%s): %w\n%s",
+				plan.Binary,
+				plan.NPMPackage,
+				err,
+				strings.TrimSpace(string(output)),
+			)
+		}
+		if _, err := exec.LookPath(plan.Binary); err != nil {
+			return fmt.Errorf("%s still not found on PATH after installation", plan.Binary)
+		}
+	}
+	return nil
 }
 
 func performIndex(ctx context.Context, cc *commandContext) (map[string]any, string, error) {
-	adapter, unit, paths, st, err := openUnitStore(cc)
+	rootPath, units, paths, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return nil, "", err
 	}
 	defer st.Close()
 
-	if err := adapter.Validate(ctx, unit); err != nil {
+	if err := ensureIndexerDependencies(ctx, units, cc.jsonOut); err != nil {
 		return nil, "", err
 	}
 
-	artifactPath := filepath.Join(paths.ArtifactDir, "index.scip")
-	indexResult, err := adapter.Index(ctx, unit, artifactPath)
+	embedder, err := embed.ResolveONNXProvider(rootPath, cc.device)
 	if err != nil {
 		return nil, "", err
 	}
 
-	index, err := scipgraph.LoadIndex(indexResult.ArtifactPath)
-	if err != nil {
-		return nil, "", err
+	perUnit := make([]map[string]any, 0, len(units))
+	adapterIDs := make([]string, 0, len(units))
+	seenAdapter := map[string]struct{}{}
+	totals := indexTotals{}
+	unitSummaries := make([]indexUnitSummary, 0, len(units))
+
+	for _, item := range units {
+		adapter := item.Adapter
+		unit := item.Unit
+
+		if err := adapter.Validate(ctx, unit); err != nil {
+			return nil, "", err
+		}
+
+		artifactPath := filepath.Join(paths.ArtifactDir, fmt.Sprintf("index.%s.scip", artifactSuffix(adapter.ID())))
+		indexResult, err := adapter.Index(ctx, unit, artifactPath)
+		if err != nil {
+			return nil, "", err
+		}
+
+		index, err := scipgraph.LoadIndex(indexResult.ArtifactPath)
+		if err != nil {
+			return nil, "", err
+		}
+
+		payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embedder)
+		if err != nil {
+			return nil, "", err
+		}
+
+		if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
+			return nil, "", err
+		}
+
+		if _, ok := seenAdapter[adapter.ID()]; !ok {
+			seenAdapter[adapter.ID()] = struct{}{}
+			adapterIDs = append(adapterIDs, adapter.ID())
+		}
+
+		files := len(payload.Files)
+		symbols := len(payload.Symbols)
+		occurrences := len(payload.Occurrences)
+		chunks := len(payload.Chunks)
+		edges := len(payload.Edges)
+		embeddings := len(payload.Embeddings)
+
+		totals.Files += files
+		totals.Symbols += symbols
+		totals.Occurrences += occurrences
+		totals.Chunks += chunks
+		totals.Edges += edges
+		totals.Embeddings += embeddings
+
+		perUnit = append(perUnit, map[string]any{
+			"unit":        unit,
+			"artifact":    indexResult.ArtifactPath,
+			"files":       files,
+			"symbols":     symbols,
+			"occurrences": occurrences,
+			"chunks":      chunks,
+			"edges":       edges,
+			"embeddings":  embeddings,
+		})
+		unitSummaries = append(unitSummaries, indexUnitSummary{
+			Language:    unit.Language,
+			AdapterID:   adapter.ID(),
+			Artifact:    indexResult.ArtifactPath,
+			Files:       files,
+			Symbols:     symbols,
+			Occurrences: occurrences,
+			Chunks:      chunks,
+			Edges:       edges,
+			Embeddings:  embeddings,
+		})
 	}
 
-	embedder, err := embed.ResolveONNXProvider(unit.RootPath, cc.device)
-	if err != nil {
-		return nil, "", err
-	}
-
-	payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embedder)
-	if err != nil {
-		return nil, "", err
-	}
-
-	if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
+	if err := st.DeleteProjectsExceptAdapters(ctx, rootPath, adapterIDs); err != nil {
 		return nil, "", err
 	}
 
 	result := map[string]any{
-		"project":     unit,
-		"artifact":    indexResult.ArtifactPath,
-		"files":       len(payload.Files),
-		"symbols":     len(payload.Symbols),
-		"occurrences": len(payload.Occurrences),
-		"chunks":      len(payload.Chunks),
-		"edges":       len(payload.Edges),
-		"embeddings":  len(payload.Embeddings),
+		"workspace":   rootPath,
+		"units":       perUnit,
+		"files":       totals.Files,
+		"symbols":     totals.Symbols,
+		"occurrences": totals.Occurrences,
+		"chunks":      totals.Chunks,
+		"edges":       totals.Edges,
+		"embeddings":  totals.Embeddings,
 	}
-
-	var out strings.Builder
-	out.WriteString("Index Complete\n")
-	out.WriteString(fmt.Sprintf("project: %s\n", unit.RootPath))
-	out.WriteString(fmt.Sprintf("artifact: %s\n", indexResult.ArtifactPath))
-	out.WriteString(fmt.Sprintf("files: %d  symbols: %d  occurrences: %d\n", len(payload.Files), len(payload.Symbols), len(payload.Occurrences)))
-	out.WriteString(fmt.Sprintf("chunks: %d  edges: %d  embeddings: %d", len(payload.Chunks), len(payload.Edges), len(payload.Embeddings)))
-
+	var embedStats *embed.Stats
 	if provider, ok := embedder.(embed.DiagnosticsProvider); ok {
 		stats := provider.LastStats()
 		if stats.Documents > 0 {
 			result["embedding_stats"] = stats
-			out.WriteString(formatEmbedStats(stats))
+			embedStats = &stats
 		}
 	}
 
-	return result, out.String(), nil
+	return result, formatIndexSummary(rootPath, unitSummaries, totals, embedStats), nil
 }
 
 func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
-	adapter, unit, _, st, err := openUnitStore(cc)
+	rootPath, units, _, st, err := openWorkspaceStore(cc)
 	if err != nil {
 		return err
 	}
 	defer st.Close()
 
-	rows, err := st.Status(ctx, unit.RootPath)
+	rows, err := st.Status(ctx, rootPath)
 	if err != nil {
 		return err
 	}
@@ -666,26 +870,56 @@ func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
 		return indexErr
 	}
 
-	freshness, err := indexer.ComputeFreshness(ctx, st, adapter, unit)
-	if err != nil {
-		return nil
+	indexedByAdapter := make(map[string]store.StatusRow, len(rows))
+	for _, row := range rows {
+		indexedByAdapter[row.AdapterID] = row
 	}
-	if ok, reason := shouldAutoReindex(freshness); ok {
+
+	detectedByAdapter := make(map[string]struct{}, len(units))
+	for _, item := range units {
+		detectedByAdapter[item.Adapter.ID()] = struct{}{}
+		if _, ok := indexedByAdapter[item.Adapter.ID()]; !ok {
+			if !cc.jsonOut {
+				fmt.Fprintf(os.Stderr, "info: missing %s index for this workspace; building index\n", item.Unit.Language)
+			}
+			_, _, indexErr := performIndex(ctx, cc)
+			return indexErr
+		}
+
+		freshness, err := indexer.ComputeFreshness(ctx, st, item.Adapter, item.Unit)
+		if err != nil {
+			continue
+		}
+		if ok, reason := shouldAutoReindex(freshness); ok {
+			if !cc.jsonOut {
+				fmt.Fprintf(
+					os.Stderr,
+					"info: %s (%s); auto re-indexing (changed=%d/%d, dirty=%d new=%d missing=%d)\n",
+					reason,
+					item.Unit.Language,
+					freshness.ChangedFiles,
+					max(freshness.IndexedFiles, freshness.CurrentFiles),
+					freshness.DirtyFiles,
+					freshness.NewFiles,
+					freshness.MissingFiles,
+				)
+			}
+			_, _, indexErr := performIndex(ctx, cc)
+			return indexErr
+		}
+	}
+
+	for _, row := range rows {
+		if _, ok := detectedByAdapter[row.AdapterID]; ok {
+			continue
+		}
 		if !cc.jsonOut {
-			fmt.Fprintf(
-				os.Stderr,
-				"info: %s; auto re-indexing (changed=%d/%d, dirty=%d new=%d missing=%d)\n",
-				reason,
-				freshness.ChangedFiles,
-				max(freshness.IndexedFiles, freshness.CurrentFiles),
-				freshness.DirtyFiles,
-				freshness.NewFiles,
-				freshness.MissingFiles,
-			)
+			fmt.Fprintf(os.Stderr, "info: adapter %s is no longer detected in this workspace; refreshing index\n", firstNonEmpty(row.AdapterID, "unknown"))
 		}
 		_, _, indexErr := performIndex(ctx, cc)
 		return indexErr
 	}
+
 	return nil
 }
 
@@ -734,7 +968,7 @@ func buildPayload(
 		fileMap[relativePath] = store.FileData{
 			RelativePath: relativePath,
 			AbsPath:      absPath,
-			Language:     doc.GetLanguage(),
+			Language:     firstNonEmpty(unit.Language, doc.GetLanguage()),
 			ContentHash:  sha256Hex(content),
 		}
 		fileSources[relativePath] = content
@@ -940,31 +1174,76 @@ func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
 	return b.String()
 }
 
+func formatIndexSummary(rootPath string, units []indexUnitSummary, totals indexTotals, stats *embed.Stats) string {
+	var out bytes.Buffer
+	out.WriteString("Index Complete\n")
+	out.WriteString(fmt.Sprintf("Workspace: %s\n", rootPath))
+	out.WriteString(fmt.Sprintf("Languages Indexed: %d\n", len(units)))
+
+	if len(units) > 0 {
+		out.WriteString("\n")
+		tw := tabwriter.NewWriter(&out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "LANG\tADAPTER\tFILES\tSYMBOLS\tOCCURRENCES\tCHUNKS\tEDGES\tEMBEDS\tARTIFACT")
+		for _, item := range units {
+			fmt.Fprintf(
+				tw,
+				"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
+				item.Language,
+				item.AdapterID,
+				formatInt(item.Files),
+				formatInt(item.Symbols),
+				formatInt(item.Occurrences),
+				formatInt(item.Chunks),
+				formatInt(item.Edges),
+				formatInt(item.Embeddings),
+				item.Artifact,
+			)
+		}
+		_ = tw.Flush()
+	}
+
+	out.WriteString("\nTotals\n")
+	out.WriteString(fmt.Sprintf("  files=%s  symbols=%s  occurrences=%s  chunks=%s  edges=%s  embeddings=%s\n",
+		formatInt(totals.Files),
+		formatInt(totals.Symbols),
+		formatInt(totals.Occurrences),
+		formatInt(totals.Chunks),
+		formatInt(totals.Edges),
+		formatInt(totals.Embeddings),
+	))
+
+	if stats != nil {
+		out.WriteString("\n")
+		out.WriteString(formatEmbedStats(*stats))
+	}
+
+	return strings.TrimRight(out.String(), "\n")
+}
+
 func formatEmbedStats(stats embed.Stats) string {
-	out := fmt.Sprintf(
-		"\nembed_provider: %s\nembed_docs: %d\nembed_dim: %d\nembed_batch: requested=%d settled=%d batches=%d oom_retries=%d\nembed_timing_ms: total=%.1f request=%.1f preload=%.1f session=%.1f tokenize=%.1f infer=%.1f normalize=%.1f serialize=%.1f decode=%.1f",
-		firstNonEmpty(stats.Provider, "unknown"),
-		stats.Documents,
-		stats.Dimensions,
-		stats.RequestedBatch,
+	var out bytes.Buffer
+	out.WriteString("Embeddings\n")
+	out.WriteString(fmt.Sprintf("  provider: %s\n", firstNonEmpty(stats.Provider, "unknown")))
+	out.WriteString(fmt.Sprintf("  docs: %s  dim: %d\n", formatInt(stats.Documents), stats.Dimensions))
+	out.WriteString(fmt.Sprintf(
+		"  batch: requested=%s  settled=%d  batches=%d  oom_retries=%d\n",
+		requestedBatchLabel(stats.RequestedBatch),
 		stats.SelectedBatch,
 		stats.BatchCount,
 		stats.OOMRetries,
-		stats.TotalMS,
-		stats.RequestMS,
-		stats.PreloadMS,
-		stats.SessionMS,
-		stats.TokenizeMS,
-		stats.InferMS,
-		stats.NormalizeMS,
-		stats.SerializeMS,
-		stats.DecodeMS,
-	)
+	))
+	out.WriteString("  timing_ms:\n")
+	out.WriteString(fmt.Sprintf("    total=%.1f  request=%.1f  preload=%.1f  session=%.1f\n", stats.TotalMS, stats.RequestMS, stats.PreloadMS, stats.SessionMS))
+	out.WriteString(fmt.Sprintf("    tokenize=%.1f  infer=%.1f  normalize=%.1f  serialize=%.1f  decode=%.1f\n", stats.TokenizeMS, stats.InferMS, stats.NormalizeMS, stats.SerializeMS, stats.DecodeMS))
+
 	if len(stats.BatchStats) > 0 {
-		out += "\nembed_batch_samples:"
+		out.WriteString("  batch_samples:\n")
+		tw := tabwriter.NewWriter(&out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "    #\tSIZE\tPROCESSED\tTOKENIZE_MS\tINFER_MS\tNORMALIZE_MS\tRETRIES\tSETTLED")
 		for _, sample := range sampleBatchStats(stats.BatchStats, 6) {
-			out += fmt.Sprintf(
-				"\n  #%d size=%d processed=%d tokenize=%.1f infer=%.1f normalize=%.1f retries=%d settled=%d",
+			fmt.Fprintf(
+				tw,
+				"    %d\t%d\t%d\t%.1f\t%.1f\t%.1f\t%d\t%d\n",
 				sample.Index,
 				sample.Size,
 				sample.Processed,
@@ -975,8 +1254,40 @@ func formatEmbedStats(stats embed.Stats) string {
 				sample.SettledBatch,
 			)
 		}
+		_ = tw.Flush()
 	}
-	return out
+	return strings.TrimRight(out.String(), "\n")
+}
+
+func requestedBatchLabel(value int) string {
+	if value <= 0 {
+		return "auto"
+	}
+	return strconv.Itoa(value)
+}
+
+func formatInt(value int) string {
+	sign := ""
+	if value < 0 {
+		sign = "-"
+		value = -value
+	}
+	text := strconv.Itoa(value)
+	if len(text) <= 3 {
+		return sign + text
+	}
+	var b strings.Builder
+	b.Grow(len(text) + len(text)/3)
+	rem := len(text) % 3
+	if rem == 0 {
+		rem = 3
+	}
+	b.WriteString(text[:rem])
+	for i := rem; i < len(text); i += 3 {
+		b.WriteByte(',')
+		b.WriteString(text[i : i+3])
+	}
+	return sign + b.String()
 }
 
 func sampleBatchStats(items []embed.BatchStats, maxItems int) []embed.BatchStats {
@@ -1328,7 +1639,7 @@ func printUsage() {
 	fmt.Print(`wave <command> [flags]
 
 Commands:
-  index     Index the current project with SCIP + Tree-sitter
+  index     Index the current project
   status    Show indexed project status
   search    Search indexed symbols/chunks
   def       Resolve a symbol definition
@@ -1368,13 +1679,23 @@ func adapterByID(id string) indexer.Adapter {
 	return nil
 }
 
-func printFreshnessWarning(ctx context.Context, st *store.Store, adapter indexer.Adapter, unit workspace.Unit, cc *commandContext) {
-	if adapter == nil {
+func printFreshnessWarning(ctx context.Context, st *store.Store, units []indexer.DetectedUnit, cc *commandContext) {
+	if cc.jsonOut {
 		return
 	}
-	freshness, err := indexer.ComputeFreshness(ctx, st, adapter, unit)
-	if err != nil || !freshness.Dirty || cc.jsonOut {
-		return
+	for _, item := range units {
+		freshness, err := indexer.ComputeFreshness(ctx, st, item.Adapter, item.Unit)
+		if err != nil || !freshness.Dirty {
+			continue
+		}
+		fmt.Fprintf(
+			os.Stderr,
+			"warning: %s index is %s; dirty=%d new=%d missing=%d\n",
+			item.Unit.Language,
+			freshness.Status,
+			freshness.DirtyFiles,
+			freshness.NewFiles,
+			freshness.MissingFiles,
+		)
 	}
-	fmt.Fprintf(os.Stderr, "warning: index is %s; dirty=%d new=%d missing=%d\n", freshness.Status, freshness.DirtyFiles, freshness.NewFiles, freshness.MissingFiles)
 }

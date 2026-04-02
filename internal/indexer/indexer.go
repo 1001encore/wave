@@ -35,14 +35,40 @@ type DeriveRequest struct {
 	Chunks      []store.ChunkData
 }
 
-func DetectUnit(adapters []Adapter, start string) (Adapter, workspace.Unit, error) {
-	var errs []error
+type DetectedUnit struct {
+	Adapter Adapter
+	Unit    workspace.Unit
+}
+
+func DetectUnits(adapters []Adapter, start string) ([]DetectedUnit, error) {
+	var (
+		units  []DetectedUnit
+		seenID = map[string]struct{}{}
+	)
 	for _, adapter := range adapters {
 		unit, err := adapter.Detect(start)
 		if err == nil {
-			return adapter, unit, nil
+			if _, exists := seenID[adapter.ID()]; exists {
+				continue
+			}
+			seenID[adapter.ID()] = struct{}{}
+			units = append(units, DetectedUnit{
+				Adapter: adapter,
+				Unit:    unit,
+			})
+			continue
 		}
-		errs = append(errs, fmt.Errorf("%s: %w", adapter.ID(), err))
 	}
-	return nil, workspace.Unit{}, fmt.Errorf("no supported workspace unit found from %s", start)
+	if len(units) == 0 {
+		return nil, fmt.Errorf("no supported workspace unit found from %s", start)
+	}
+	return units, nil
+}
+
+func DetectUnit(adapters []Adapter, start string) (Adapter, workspace.Unit, error) {
+	units, err := DetectUnits(adapters, start)
+	if err != nil {
+		return nil, workspace.Unit{}, err
+	}
+	return units[0].Adapter, units[0].Unit, nil
 }

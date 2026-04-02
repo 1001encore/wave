@@ -51,7 +51,7 @@ wave context "authentication flow"
 - `--mode auto|hybrid|symbol|semantic|graph`
 - `--limit <n>`
 - `--explain`
-- `--device cpu|cuda`
+- `--device cpu|cuda` (default: `cuda`)
 
 ## Requirements
 
@@ -59,6 +59,8 @@ Indexing shells out to SCIP indexers:
 
 - Python: `scip-python` (plus `python3` and `node`)
 - TypeScript: `scip-typescript` (plus `node`)
+
+On first `wave index`, `wave` detects workspace languages and auto-installs any missing SCIP indexers (`scip-python` / `scip-typescript`) via `npm` for detected languages only.
 
 Embeddings use ONNX (`all-MiniLM-L6-v2`). `wave` bootstraps a local Python env for embedding dependencies when needed.
 

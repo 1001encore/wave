@@ -24,7 +24,7 @@ type Freshness struct {
 }
 
 func ComputeFreshness(ctx context.Context, st *store.Store, adapter Adapter, unit workspace.Unit) (Freshness, error) {
-	indexedFiles, err := st.IndexedFiles(ctx, unit.RootPath)
+	indexedFiles, err := st.IndexedFiles(ctx, unit.RootPath, adapter.ID())
 	if err != nil {
 		return Freshness{}, err
 	}

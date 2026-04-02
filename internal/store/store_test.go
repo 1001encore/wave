@@ -6,6 +6,42 @@ import (
 	"testing"
 )
 
+func singleSymbolPayload(root string, adapterID string, language string, manifest string, tool string, relPath string, symbol string, displayName string) IndexPayload {
+	return IndexPayload{
+		Project: ProjectData{
+			RootPath:          root,
+			Name:              "project",
+			Language:          language,
+			ManifestPath:      manifest,
+			EnvironmentSource: "",
+			AdapterID:         adapterID,
+			ScipArtifactPath:  filepath.Join(root, ".wave", "artifacts", "index."+adapterID+".scip"),
+			ToolName:          tool,
+			ToolVersion:       "test",
+		},
+		Files: []FileData{
+			{
+				RelativePath: relPath,
+				AbsPath:      filepath.Join(root, relPath),
+				Language:     language,
+				ContentHash:  "hash-" + relPath,
+			},
+		},
+		Symbols: []SymbolData{
+			{
+				ScipSymbol:   symbol,
+				DisplayName:  displayName,
+				Kind:         "function",
+				FilePath:     relPath,
+				DefStartLine: 0,
+				DefStartCol:  0,
+				DefEndLine:   0,
+				DefEndCol:    8,
+			},
+		},
+	}
+}
+
 func TestListReferencesBySymbolIDIncludesReferenceFamily(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()
@@ -175,5 +211,130 @@ func TestLinkedSymbolsForChunksReturnsPersistedBridgeLinks(t *testing.T) {
 	}
 	if len(links) != 2 {
 		t.Fatalf("link count = %d, want 2", len(links))
+	}
+}
+
+func TestReplaceProjectIndexReplacesOnlyMatchingAdapter(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	st, err := Open(filepath.Join(tmp, "wave.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	root := filepath.Join(tmp, "workspace")
+	pyPayloadV1 := singleSymbolPayload(
+		root,
+		"python-scip",
+		"python",
+		filepath.Join(root, "pyproject.toml"),
+		"scip-python",
+		"svc.py",
+		"py pkg old_handler()",
+		"old_handler",
+	)
+	tsPayload := singleSymbolPayload(
+		root,
+		"typescript-scip",
+		"typescript",
+		filepath.Join(root, "tsconfig.json"),
+		"scip-typescript",
+		"src/index.ts",
+		"ts pkg ts_handler()",
+		"ts_handler",
+	)
+	pyPayloadV2 := singleSymbolPayload(
+		root,
+		"python-scip",
+		"python",
+		filepath.Join(root, "pyproject.toml"),
+		"scip-python",
+		"svc.py",
+		"py pkg new_handler()",
+		"new_handler",
+	)
+
+	if err := st.ReplaceProjectIndex(ctx, pyPayloadV1); err != nil {
+		t.Fatalf("replace python index v1: %v", err)
+	}
+	if err := st.ReplaceProjectIndex(ctx, tsPayload); err != nil {
+		t.Fatalf("replace typescript index: %v", err)
+	}
+	if err := st.ReplaceProjectIndex(ctx, pyPayloadV2); err != nil {
+		t.Fatalf("replace python index v2: %v", err)
+	}
+
+	oldPy, err := st.FindDefinition(ctx, root, "old_handler")
+	if err != nil {
+		t.Fatalf("find old python definition: %v", err)
+	}
+	if oldPy != nil {
+		t.Fatal("expected old python definition to be replaced")
+	}
+
+	newPy, err := st.FindDefinition(ctx, root, "new_handler")
+	if err != nil {
+		t.Fatalf("find new python definition: %v", err)
+	}
+	if newPy == nil {
+		t.Fatal("expected new python definition")
+	}
+
+	tsDef, err := st.FindDefinition(ctx, root, "ts_handler")
+	if err != nil {
+		t.Fatalf("find typescript definition: %v", err)
+	}
+	if tsDef == nil {
+		t.Fatal("expected typescript definition to remain indexed")
+	}
+}
+
+func TestSearchSymbolsAggregatesAcrossAdaptersForSameRoot(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	st, err := Open(filepath.Join(tmp, "wave.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	root := filepath.Join(tmp, "workspace")
+	pyPayload := singleSymbolPayload(
+		root,
+		"python-scip",
+		"python",
+		filepath.Join(root, "pyproject.toml"),
+		"scip-python",
+		"svc.py",
+		"py pkg py_handler()",
+		"py_handler",
+	)
+	tsPayload := singleSymbolPayload(
+		root,
+		"typescript-scip",
+		"typescript",
+		filepath.Join(root, "tsconfig.json"),
+		"scip-typescript",
+		"src/index.ts",
+		"ts pkg ts_handler()",
+		"ts_handler",
+	)
+
+	if err := st.ReplaceProjectIndex(ctx, pyPayload); err != nil {
+		t.Fatalf("replace python index: %v", err)
+	}
+	if err := st.ReplaceProjectIndex(ctx, tsPayload); err != nil {
+		t.Fatalf("replace typescript index: %v", err)
+	}
+
+	hits, err := st.SearchSymbols(ctx, root, "handler", 10)
+	if err != nil {
+		t.Fatalf("search symbols: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("symbol hit count = %d, want 2", len(hits))
 	}
 }
