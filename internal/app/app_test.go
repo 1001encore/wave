@@ -1,10 +1,13 @@
 package app
 
 import (
+	"bytes"
 	"flag"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	queryrouter "github.com/1001encore/wave/internal/query"
 	"github.com/1001encore/wave/internal/store"
 )
 
@@ -100,6 +103,20 @@ func TestBindCommonFlagsDefaultsDeviceToCUDA(t *testing.T) {
 	if cc.device != "cuda" {
 		t.Fatalf("device default = %q, want %q", cc.device, "cuda")
 	}
+	if cc.limit != defaultResultLimit {
+		t.Fatalf("limit default = %d, want %d", cc.limit, defaultResultLimit)
+	}
+}
+
+func TestBindCommonFlagsWithLimitOverridesDefault(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cc := bindCommonFlagsWithLimit(fs, 3)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	if cc.limit != 3 {
+		t.Fatalf("limit default = %d, want %d", cc.limit, 3)
+	}
 }
 
 func TestIndexerInstallSpecForAdapter(t *testing.T) {
@@ -128,5 +145,94 @@ func TestIndexerInstallSpecForAdapter(t *testing.T) {
 		if got.NPMPackage != tt.wantPkg {
 			t.Fatalf("adapter %q: npm package = %q, want %q", tt.adapterID, got.NPMPackage, tt.wantPkg)
 		}
+	}
+}
+
+func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
+	def := &store.DefinitionResult{
+		SymbolID:    1,
+		DisplayName: "greet",
+		Kind:        "function",
+		Path:        "/tmp/a.py",
+		StartLine:   0,
+		StartCol:    0,
+		DocSummary:  "python",
+	}
+	result := queryrouter.DefinitionResult{
+		Definition: def,
+		Candidates: []store.DefinitionResult{
+			*def,
+			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: "/tmp/b.ts", StartLine: 10, StartCol: 3},
+			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: "/tmp/c.rb", StartLine: 20, StartCol: 5},
+			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: "/tmp/d.go", StartLine: 30, StartCol: 7},
+		},
+	}
+
+	var buf bytes.Buffer
+	writeDefinitionOutput(&buf, "greet", result, true, 3)
+	out := buf.String()
+
+	if !strings.Contains(out, "Definition: greet [function]") {
+		t.Fatalf("output missing primary definition:\n%s", out)
+	}
+	if !strings.Contains(out, "---") {
+		t.Fatalf("output missing divider:\n%s", out)
+	}
+	if !strings.Contains(out, "Other matches for \"greet\":") {
+		t.Fatalf("output missing alternate heading:\n%s", out)
+	}
+	if !strings.Contains(out, "/tmp/b.ts:11:4") || !strings.Contains(out, "/tmp/c.rb:21:6") || !strings.Contains(out, "/tmp/d.go:31:8") {
+		t.Fatalf("output missing alternates:\n%s", out)
+	}
+}
+
+func TestWriteDefinitionOutputRespectsAlternateLimit(t *testing.T) {
+	def := &store.DefinitionResult{
+		SymbolID:    1,
+		DisplayName: "greet",
+		Kind:        "function",
+		Path:        "/tmp/a.py",
+	}
+	result := queryrouter.DefinitionResult{
+		Definition: def,
+		Candidates: []store.DefinitionResult{
+			*def,
+			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: "/tmp/b.ts", StartLine: 10, StartCol: 3},
+			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: "/tmp/c.rb", StartLine: 20, StartCol: 5},
+			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: "/tmp/d.go", StartLine: 30, StartCol: 7},
+		},
+	}
+
+	var buf bytes.Buffer
+	writeDefinitionOutput(&buf, "greet", result, false, 2)
+	out := buf.String()
+
+	if !strings.Contains(out, "/tmp/b.ts:11:4") || !strings.Contains(out, "/tmp/c.rb:21:6") {
+		t.Fatalf("output missing expected alternates:\n%s", out)
+	}
+	if strings.Contains(out, "/tmp/d.go:31:8") {
+		t.Fatalf("output should be limited to first 2 alternates:\n%s", out)
+	}
+	if !strings.Contains(out, "... and 1 more") {
+		t.Fatalf("output missing overflow count:\n%s", out)
+	}
+}
+
+func TestDefinitionJSONPayloadIncludesCandidatesByDefault(t *testing.T) {
+	result := queryrouter.DefinitionResult{
+		Definition: &store.DefinitionResult{SymbolID: 1, DisplayName: "greet"},
+		Candidates: []store.DefinitionResult{
+			{SymbolID: 1, DisplayName: "greet"},
+			{SymbolID: 2, DisplayName: "greet"},
+		},
+	}
+
+	payload := definitionJSONPayload(result, false)
+	got, ok := payload.(queryrouter.DefinitionResult)
+	if !ok {
+		t.Fatalf("payload type = %T, want queryrouter.DefinitionResult", payload)
+	}
+	if len(got.Candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(got.Candidates))
 	}
 }

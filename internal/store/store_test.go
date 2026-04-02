@@ -135,6 +135,97 @@ func TestListReferencesBySymbolIDIncludesReferenceFamily(t *testing.T) {
 	}
 }
 
+func TestListReferencesBySymbolIDsIncludesAllMatchingDefinitions(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+
+	st, err := Open(filepath.Join(tmp, "wave.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	root := filepath.Join(tmp, "project")
+	payload := IndexPayload{
+		Project: ProjectData{
+			RootPath:          root,
+			Name:              "project",
+			Language:          "polyglot",
+			ManifestPath:      filepath.Join(root, "pyproject.toml"),
+			EnvironmentSource: "",
+			AdapterID:         "mixed",
+			ScipArtifactPath:  filepath.Join(root, ".wave", "artifacts", "index.scip"),
+			ToolName:          "test-indexer",
+			ToolVersion:       "test",
+		},
+		Files: []FileData{
+			{RelativePath: "app/main.py", AbsPath: filepath.Join(root, "app/main.py"), Language: "python", ContentHash: "py"},
+			{RelativePath: "src/index.ts", AbsPath: filepath.Join(root, "src/index.ts"), Language: "typescript", ContentHash: "ts"},
+		},
+		Symbols: []SymbolData{
+			{
+				ScipSymbol:   "py greet()",
+				DisplayName:  "greet",
+				Kind:         "function",
+				FilePath:     "app/main.py",
+				DefStartLine: 0,
+				DefEndLine:   1,
+			},
+			{
+				ScipSymbol:   "ts greet()",
+				DisplayName:  "greet",
+				Kind:         "function",
+				FilePath:     "src/index.ts",
+				DefStartLine: 0,
+				DefEndLine:   1,
+			},
+		},
+		Occurrences: []OccurrenceData{
+			{
+				FilePath:     "app/main.py",
+				Symbol:       "py greet()",
+				StartLine:    3,
+				StartCol:     1,
+				EndLine:      3,
+				EndCol:       6,
+				SyntaxKind:   "identifier",
+				IsDefinition: false,
+			},
+			{
+				FilePath:     "src/index.ts",
+				Symbol:       "ts greet()",
+				StartLine:    5,
+				StartCol:     2,
+				EndLine:      5,
+				EndCol:       7,
+				SyntaxKind:   "identifier",
+				IsDefinition: false,
+			},
+		},
+	}
+
+	if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
+		t.Fatalf("replace project index: %v", err)
+	}
+
+	defs, err := st.FindDefinitions(ctx, root, "greet", 10)
+	if err != nil {
+		t.Fatalf("find definitions: %v", err)
+	}
+	if len(defs) != 2 {
+		t.Fatalf("definition count = %d, want 2", len(defs))
+	}
+
+	ids := []int64{defs[0].SymbolID, defs[1].SymbolID}
+	refs, err := st.ListReferencesBySymbolIDs(ctx, root, ids, 10)
+	if err != nil {
+		t.Fatalf("list references by symbol ids: %v", err)
+	}
+	if len(refs) != 2 {
+		t.Fatalf("reference count = %d, want 2", len(refs))
+	}
+}
+
 func TestLinkedSymbolsForChunksReturnsPersistedBridgeLinks(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

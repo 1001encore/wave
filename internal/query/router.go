@@ -148,11 +148,15 @@ func (r *Router) Definition(ctx context.Context, rootPath string, symbol string)
 		return DefinitionResult{}, err
 	}
 	def, ambiguous := resolveDefinition(symbol, candidates)
+	defs := exactDefinitionCandidates(symbol, candidates)
+	if len(defs) == 0 && def != nil {
+		defs = []store.DefinitionResult{*def}
+	}
 	result := DefinitionResult{
 		Plan:       Plan{Mode: "exact_symbol_lookup", Reason: "definition queries route directly to symbol lookup"},
 		Definition: def,
 	}
-	if ambiguous {
+	if len(defs) > 1 || ambiguous {
 		result.Candidates = candidates
 	}
 	if def != nil {
@@ -170,27 +174,25 @@ func (r *Router) References(ctx context.Context, rootPath string, symbol string,
 		return ReferencesResult{}, err
 	}
 	def, ambiguous := resolveDefinition(symbol, candidates)
-	if def == nil {
-		result := ReferencesResult{
-			Plan: Plan{Mode: "graph_reference_lookup", Reason: "references queries route to the occurrence graph"},
-		}
-		if ambiguous {
-			result.Candidates = candidates
-		}
-		return result, nil
-	}
-	refs, err := r.store.ListReferencesBySymbolID(ctx, rootPath, def.SymbolID, limit)
-	if err != nil {
-		return ReferencesResult{}, err
+	defs := exactDefinitionCandidates(symbol, candidates)
+	if len(defs) == 0 && def != nil {
+		defs = []store.DefinitionResult{*def}
 	}
 	result := ReferencesResult{
 		Plan:       Plan{Mode: "graph_reference_lookup", Reason: "references queries route to the occurrence graph"},
 		Definition: def,
-		References: refs,
 	}
-	if ambiguous {
+	if len(defs) > 1 || ambiguous {
 		result.Candidates = candidates
 	}
+	if len(defs) == 0 {
+		return result, nil
+	}
+	refs, err := r.store.ListReferencesBySymbolIDs(ctx, rootPath, definitionSymbolIDs(defs), limit)
+	if err != nil {
+		return ReferencesResult{}, err
+	}
+	result.References = refs
 	return result, nil
 }
 
@@ -710,6 +712,32 @@ func resolveDefinition(query string, candidates []store.DefinitionResult) (*stor
 	}
 	best := rankDefinitionCandidates(candidates)
 	return &best, true
+}
+
+func exactDefinitionCandidates(query string, candidates []store.DefinitionResult) []store.DefinitionResult {
+	exact := make([]store.DefinitionResult, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.DisplayName == query || candidate.ScipSymbol == query {
+			exact = append(exact, candidate)
+		}
+	}
+	return exact
+}
+
+func definitionSymbolIDs(defs []store.DefinitionResult) []int64 {
+	if len(defs) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(defs))
+	seen := make(map[int64]struct{}, len(defs))
+	for _, def := range defs {
+		if _, ok := seen[def.SymbolID]; ok {
+			continue
+		}
+		seen[def.SymbolID] = struct{}{}
+		ids = append(ids, def.SymbolID)
+	}
+	return ids
 }
 
 func rankDefinitionCandidates(candidates []store.DefinitionResult) store.DefinitionResult {

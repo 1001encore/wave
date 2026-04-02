@@ -1348,27 +1348,37 @@ func (s *Store) ListReferences(ctx context.Context, rootPath string, symbol stri
 	return s.ListReferencesBySymbolID(ctx, rootPath, def.SymbolID, limit)
 }
 
-func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, symbolID int64, limit int) ([]ReferenceResult, error) {
+func (s *Store) ListReferencesBySymbolIDs(ctx context.Context, rootPath string, symbolIDs []int64, limit int) ([]ReferenceResult, error) {
 	cleanRoot := filepath.Clean(rootPath)
 	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
 		return nil, err
+	}
+	if len(symbolIDs) == 0 {
+		return nil, nil
 	}
 	if limit <= 0 {
 		limit = 10
 	}
 
-	rows, err := s.db.QueryContext(
-		ctx,
-		`WITH reference_family(symbol_id) AS (
-			SELECT ?
+	seedPlaceholders := make([]string, 0, len(symbolIDs))
+	args := make([]any, 0, len(symbolIDs)+3)
+	for _, symbolID := range symbolIDs {
+		seedPlaceholders = append(seedPlaceholders, "(?)")
+		args = append(args, symbolID)
+	}
+	args = append(args, cleanRoot, cleanRoot, limit)
+
+	query := fmt.Sprintf(`WITH seed(symbol_id) AS (VALUES %s),
+		reference_family(symbol_id) AS (
+			SELECT symbol_id FROM seed
 			UNION
 			SELECT e.dst_symbol_id
 			FROM edges e
-			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.src_symbol_id = ? AND e.kind = 'reference'
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.src_symbol_id IN (SELECT symbol_id FROM seed) AND e.kind = 'reference'
 			UNION
 			SELECT e.src_symbol_id
 			FROM edges e
-			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.dst_symbol_id = ? AND e.kind = 'reference'
+			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.dst_symbol_id IN (SELECT symbol_id FROM seed) AND e.kind = 'reference'
 		)
 		SELECT
 			o.symbol_id,
@@ -1384,16 +1394,11 @@ func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, s
 		JOIN files f ON f.id = o.file_id
 		WHERE o.symbol_id IN (SELECT symbol_id FROM reference_family) AND o.is_definition = 0
 		ORDER BY f.abs_path, o.start_line, o.start_col
-		LIMIT ?`,
-		symbolID,
-		cleanRoot,
-		symbolID,
-		cleanRoot,
-		symbolID,
-		limit,
-	)
+		LIMIT ?`, strings.Join(seedPlaceholders, ", "))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list references: %w", err)
+		return nil, fmt.Errorf("list references by symbol IDs: %w", err)
 	}
 	defer rows.Close()
 
@@ -1415,6 +1420,10 @@ func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, s
 		refs = append(refs, ref)
 	}
 	return refs, rows.Err()
+}
+
+func (s *Store) ListReferencesBySymbolID(ctx context.Context, rootPath string, symbolID int64, limit int) ([]ReferenceResult, error) {
+	return s.ListReferencesBySymbolIDs(ctx, rootPath, []int64{symbolID}, limit)
 }
 
 func tokenizeSearchTerms(query string) []string {

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -75,6 +76,9 @@ const (
 	autoReindexMinChangedFiles  = 24
 	autoReindexMinChangedRatio  = 0.18
 	autoReindexMissingFileFloor = 8
+	defaultResultLimit          = 10
+	defaultDefLimit             = 3
+	defaultRefsLimit            = 3
 )
 
 func adapters() []indexer.Adapter {
@@ -323,7 +327,7 @@ func runSearch(ctx context.Context, args []string) int {
 
 func runDef(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("def", flag.ContinueOnError)
-	cc := bindCommonFlags(fs)
+	cc := bindCommonFlagsWithLimit(fs, defaultDefLimit)
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -377,28 +381,16 @@ func runDef(ctx context.Context, args []string) int {
 		return fail(fmt.Errorf("no definition found for %q", symbol))
 	}
 	if cc.jsonOut {
-		if cc.explain {
-			printJSON(result)
-		} else {
-			printJSON(result.Definition)
-		}
+		printJSON(definitionJSONPayload(result, cc.explain))
 		return 0
 	}
-
-	if cc.explain {
-		fmt.Printf("Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
-	}
-	fmt.Printf("Definition: %s [%s]\n", result.Definition.DisplayName, result.Definition.Kind)
-	fmt.Printf("Location: %s:%d:%d\n", result.Definition.Path, result.Definition.StartLine+1, result.Definition.StartCol+1)
-	if result.Definition.DocSummary != "" {
-		fmt.Printf("Doc: %s\n", result.Definition.DocSummary)
-	}
+	writeDefinitionOutput(os.Stdout, symbol, result, cc.explain, cc.limit)
 	return 0
 }
 
 func runRefs(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("refs", flag.ContinueOnError)
-	cc := bindCommonFlags(fs)
+	cc := bindCommonFlagsWithLimit(fs, defaultRefsLimit)
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -578,12 +570,16 @@ func runContext(ctx context.Context, args []string) int {
 }
 
 func bindCommonFlags(fs *flag.FlagSet) *commandContext {
+	return bindCommonFlagsWithLimit(fs, defaultResultLimit)
+}
+
+func bindCommonFlagsWithLimit(fs *flag.FlagSet, defaultLimit int) *commandContext {
 	cc := &commandContext{}
 	cwd, _ := os.Getwd()
 	fs.StringVar(&cc.rootPath, "root", cwd, "project root or a path inside the project")
 	fs.StringVar(&cc.dbPath, "db", "", "override SQLite database path")
 	fs.BoolVar(&cc.jsonOut, "json", false, "emit JSON")
-	fs.IntVar(&cc.limit, "limit", 10, "result limit")
+	fs.IntVar(&cc.limit, "limit", defaultLimit, "result limit")
 	fs.BoolVar(&cc.explain, "explain", false, "include routing and freshness details")
 	fs.StringVar(&cc.mode, "mode", "auto", "query mode: auto, hybrid, symbol, semantic, graph")
 	fs.StringVar(&cc.device, "device", "cuda", "embedding device: cpu, cuda (default: cuda)")
@@ -1697,5 +1693,69 @@ func printFreshnessWarning(ctx context.Context, st *store.Store, units []indexer
 			freshness.NewFiles,
 			freshness.MissingFiles,
 		)
+	}
+}
+
+func definitionJSONPayload(result queryrouter.DefinitionResult, explain bool) any {
+	if explain || len(result.Candidates) > 0 || result.Definition == nil {
+		return result
+	}
+	return result.Definition
+}
+
+func writeDefinitionOutput(w io.Writer, symbol string, result queryrouter.DefinitionResult, explain bool, alternateLimit int) {
+	if explain {
+		fmt.Fprintf(w, "Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
+	}
+	printDefinitionEntry(w, "Definition", result.Definition)
+
+	if len(result.Candidates) == 0 {
+		return
+	}
+
+	alternates := make([]store.DefinitionResult, 0, len(result.Candidates))
+	for _, candidate := range result.Candidates {
+		if result.Definition != nil && candidate.SymbolID == result.Definition.SymbolID {
+			continue
+		}
+		alternates = append(alternates, candidate)
+	}
+	if len(alternates) == 0 {
+		return
+	}
+
+	fmt.Fprintln(w, "---")
+	fmt.Fprintf(w, "Other matches for %q:\n", symbol)
+	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "NAME\tKIND\tLOCATION")
+	limit := len(alternates)
+	if alternateLimit > 0 {
+		limit = min(limit, alternateLimit)
+	}
+	for _, candidate := range alternates[:limit] {
+		fmt.Fprintf(
+			tw,
+			"%s\t%s\t%s:%d:%d\n",
+			candidate.DisplayName,
+			firstNonEmpty(candidate.Kind, "symbol"),
+			candidate.Path,
+			candidate.StartLine+1,
+			candidate.StartCol+1,
+		)
+	}
+	_ = tw.Flush()
+	if len(alternates) > limit {
+		fmt.Fprintf(w, "... and %d more\n", len(alternates)-limit)
+	}
+}
+
+func printDefinitionEntry(w io.Writer, label string, def *store.DefinitionResult) {
+	if def == nil {
+		return
+	}
+	fmt.Fprintf(w, "%s: %s [%s]\n", label, def.DisplayName, def.Kind)
+	fmt.Fprintf(w, "Location: %s:%d:%d\n", def.Path, def.StartLine+1, def.StartCol+1)
+	if def.DocSummary != "" {
+		fmt.Fprintf(w, "Doc: %s\n", def.DocSummary)
 	}
 }
