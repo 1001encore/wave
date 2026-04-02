@@ -1,77 +1,58 @@
-# Agent Guidelines for wave
+# Agent Guide for wave
 
-`wave` is a code intelligence CLI. Use it to search, navigate, and understand
-codebases that have been indexed.
+Use `wave` as a fast code-intelligence layer over an indexed project.
 
-## Indexing a project
+## Default Workflow
 
-Before querying, index the project once from its root:
+1. Ensure the project is indexed:
 
 ```bash
 wave index
 ```
 
-This auto-detects the language (Python or TypeScript) from the project manifest,
-runs the SCIP indexer, extracts tree-sitter chunks, derives call/reference edges,
-and generates vector embeddings. Re-run after significant code changes.
-
-Use `wave status` to check freshness before querying.
-
-## Searching
+2. Run one of the core commands:
 
 ```bash
-# Symbol or identifier lookup
-wave search "ClassName"
-
-# Natural language
-wave search "retry logic for HTTP requests"
-
-# Force a specific retrieval mode
-wave search --mode symbol "parse"
-wave search --mode semantic "error handling"
-wave search --mode graph "Router"
+wave search "query"
+wave def SymbolName
+wave refs SymbolName
+wave context "query"
 ```
 
-Prefer `--json` for structured output you can parse:
+## Command Intent
+
+- `search` — best for discovery (identifier or natural language)
+- `def` — precise symbol definition lookup
+- `refs` — symbol usage map
+- `context` — compact local neighborhood (seed + neighbors + graph + refs)
+- `status` — index freshness and counts
+
+## Modes and JSON
+
+For automation, always use JSON:
 
 ```bash
 wave search --json "handleRequest"
+wave context --json "auth middleware"
 ```
 
-## Definitions and references
+Use explicit retrieval modes when needed:
 
 ```bash
-wave def SymbolName          # jump to definition
-wave refs SymbolName         # list all references
+wave search --mode symbol "Router"
+wave search --mode semantic "retry with exponential backoff"
+wave search --mode graph "PaymentService"
 ```
 
-When the symbol is ambiguous, `wave` returns the best-ranked candidate and
-includes a `candidates` array. Use the SCIP symbol string for exact matches.
+## Practical Tips
 
-## Context bundles
+- Prefer `wave context --json` when you need a single, rich payload.
+- Use `wave search --json --explain` to inspect routing decisions.
+- Use `--root <path>` when running outside the target project directory.
+- Use `--device cuda` when GPU is available and embedding latency matters.
 
-```bash
-wave context "functionName"
-```
+## Freshness
 
-Returns the seed chunk, file neighbors, graph-connected chunks (callers/callees),
-and references — everything needed to understand a symbol in context.
-
-## Flags
-
-| Flag | Description |
-|---|---|
-| `--json` | Structured JSON output (always use this for programmatic access) |
-| `--limit N` | Cap result count (default 10) |
-| `--explain` | Show query routing plan and freshness |
-| `--mode M` | `auto`, `hybrid`, `symbol`, `semantic`, `graph` |
-| `--device D` | Embedding device: `cpu`, `cuda` |
-| `--root PATH` | Override project root |
-
-## Tips
-
-- Use `wave search --json --explain` to see which retrieval path was taken.
-- Pipe `wave def --json Symbol | jq .path` to get a file path for further reads.
-- `wave context --json` gives the richest result — definition, neighbors, graph
-  neighbors, and references in one call.
-- The index lives in `.wave/wave.db`; delete it to force a full re-index.
+- `wave` stores index state in `.wave/wave.db`.
+- Normal query commands may auto re-index after large refactors.
+- Run `wave status` if results look stale.

@@ -1,124 +1,71 @@
 # wave
 
-Code intelligence CLI powered by [SCIP](https://sourcegraph.com/docs/code-intelligence/references/scip) graphs, [tree-sitter](https://tree-sitter.github.io/) syntax, and vector embeddings.
+Code intelligence CLI for Python and TypeScript projects.
 
-Index a project once, then search symbols, jump to definitions, list references, and pull contextual bundles — all from the terminal.
+`wave` indexes your codebase once, then gives fast symbol + semantic + graph retrieval from the terminal.
 
 ## Install
 
-### Prebuilt binaries
-
-Download the latest release from [GitHub Releases](https://github.com/1001encore/wave/releases):
-
-| Platform | Archive |
-|---|---|
-| Linux x86_64 | `wave_linux_amd64.tar.gz` |
-| Linux arm64 | `wave_linux_arm64.tar.gz` |
-| macOS x86_64 | `wave_darwin_amd64.tar.gz` |
-| macOS Apple Silicon | `wave_darwin_arm64.tar.gz` |
-| Windows x86_64 | `wave_windows_amd64.zip` |
-
-#### One-line install (Windows PowerShell)
-
-```powershell
-irm https://raw.githubusercontent.com/1001encore/wave/main/scripts/install.ps1 | iex
-```
-
-#### One-line install (Linux Bash)
+### One-line install (Linux/macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/1001encore/wave/main/scripts/install.sh | sh
 ```
 
-Scripts used by the commands above:
+### One-line install (Windows PowerShell)
 
-- `scripts/install.ps1`
-- `scripts/install.sh`
-
-```bash
-# Example: Linux amd64
-curl -LO https://github.com/1001encore/wave/releases/latest/download/wave_linux_amd64.tar.gz
-tar xzf wave_linux_amd64.tar.gz
-sudo mv wave /usr/local/bin/
+```powershell
+irm https://raw.githubusercontent.com/1001encore/wave/main/scripts/install.ps1 | iex
 ```
 
-### From source
+### Other distributions
+
+Use GitHub Releases for manual binaries and archives:
+
+- https://github.com/1001encore/wave/releases
+
+## Quick Start
 
 ```bash
-go install github.com/1001encore/wave/cmd/wave@latest
-```
-
-Or build locally:
-
-```bash
-git clone https://github.com/1001encore/wave.git
-cd wave
-go build -o wave ./cmd/wave
-```
-
-## Requirements
-
-`wave` shells out to language-specific SCIP indexers at index time:
-
-- **Python** — `scip-python` (also needs `python3` and `node`)
-- **TypeScript** — `scip-typescript` (needs `node`)
-
-Embeddings require a Python environment with `numpy`, `onnxruntime`, and `tokenizers`. If none is found, `wave` creates a local venv and installs them automatically.
-
-## Quick start
-
-```bash
-cd your-project/
-
-# Index the project (detects language from manifest)
+cd your-project
 wave index
-
-# Search by name or natural language
 wave search "handleRequest"
-wave search "function that parses config files"
-
-# Jump to a definition
 wave def MyClass
-
-# List references
 wave refs processData
-
-# Get a contextual bundle around a query
 wave context "authentication flow"
 ```
 
-## Commands
+## Core Commands
 
-| Command | Description |
-|---|---|
-| `index` | Index the project with SCIP + tree-sitter, generate embeddings |
-| `status` | Show indexed project status and freshness |
-| `search` | Search symbols and code chunks |
-| `def` | Resolve a symbol's definition location |
-| `refs` | List all references to a symbol |
-| `context` | Build a contextual bundle (definition + neighbors + graph + refs) |
+- `wave index` — build/update index
+- `wave status` — show index freshness
+- `wave search <query>` — hybrid retrieval
+- `wave def <symbol>` — jump to definition
+- `wave refs <symbol>` — list references
+- `wave context <query>` — definition + neighbors + graph + refs
 
-## Flags
+## Common Flags
 
-| Flag | Default | Description |
-|---|---|---|
-| `--root` | cwd | Project root path |
-| `--json` | false | Emit JSON output |
-| `--limit` | 10 | Max results |
-| `--explain` | false | Show query routing details |
-| `--mode` | auto | Query mode: `auto`, `hybrid`, `symbol`, `semantic`, `graph` |
-| `--device` | auto | Embedding device: `cpu`, `cuda` |
-| `--db` | `.wave/wave.db` | Override database path |
+- `--root <path>` — project root (or path inside project)
+- `--json` — structured output
+- `--mode auto|hybrid|symbol|semantic|graph`
+- `--limit <n>`
+- `--explain`
+- `--device cpu|cuda`
 
-## How it works
+## Requirements
 
-1. **SCIP indexing** — calls `scip-python` or `scip-typescript` to produce a symbol graph with definitions, references, and relationships.
-2. **Tree-sitter chunking** — parses source into semantic chunks (functions, classes, imports) with parent-child relationships.
-3. **Edge derivation** — combines SCIP occurrences with tree-sitter AST walks to emit `calls`, `reads`, `writes`, `uses`, `imports`, and `contains` edges.
-4. **Vector embeddings** — embeds each chunk via ONNX (`all-MiniLM-L6-v2`) for semantic search. Model is auto-downloaded on first run.
-5. **Hybrid retrieval** — queries fuse exact symbol lookup, lexical search, semantic similarity, and graph traversal, ranked and re-ranked by kind and span.
+Indexing shells out to SCIP indexers:
 
-All data is stored in a single SQLite database (`.wave/wave.db`) using [sqlite-vec](https://github.com/asg017/sqlite-vec) for vector search.
+- Python: `scip-python` (plus `python3` and `node`)
+- TypeScript: `scip-typescript` (plus `node`)
+
+Embeddings use ONNX (`all-MiniLM-L6-v2`). `wave` bootstraps a local Python env for embedding dependencies when needed.
+
+## Notes
+
+- Index data is stored at `.wave/wave.db`.
+- Large refactors can trigger automatic re-index before query commands.
 
 ## License
 
