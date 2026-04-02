@@ -72,8 +72,9 @@ jobs:
         shell: bash
         run: |
           export PATH="/c/msys64/mingw64/bin:$PATH"
-          export CGO_CFLAGS="-I/c/msys64/mingw64/include"
-          export CGO_LDFLAGS="-L/c/msys64/mingw64/lib"
+          export CC="x86_64-w64-mingw32-gcc"
+          export CGO_CFLAGS="-IC:/msys64/mingw64/include"
+          export CGO_LDFLAGS="-LC:/msys64/mingw64/lib"
           go test ./...
 
       - name: Build
@@ -92,9 +93,10 @@ jobs:
         shell: bash
         run: |
           export PATH="/c/msys64/mingw64/bin:$PATH"
+          export CC="x86_64-w64-mingw32-gcc"
           export CGO_ENABLED=1
-          export CGO_CFLAGS="-I/c/msys64/mingw64/include"
-          export CGO_LDFLAGS="-L/c/msys64/mingw64/lib"
+          export CGO_CFLAGS="-IC:/msys64/mingw64/include"
+          export CGO_LDFLAGS="-LC:/msys64/mingw64/lib"
           mkdir -p dist
           go build -trimpath -ldflags "-s -w" -o "dist/wave.exe" ./cmd/wave
 
