@@ -69,12 +69,12 @@ jobs:
 
       - name: Test (Windows)
         if: matrix.asset_os == 'windows'
-        shell: bash
+        shell: msys2 {0}
         run: |
-          export PATH="/c/msys64/mingw64/bin:$PATH"
-          export CC="x86_64-w64-mingw32-gcc"
-          export CGO_CFLAGS="-IC:/msys64/mingw64/include"
-          export CGO_LDFLAGS="-LC:/msys64/mingw64/lib"
+          export CGO_ENABLED=1
+          export CC="gcc"
+          export CXX="g++"
+          export PKG_CONFIG_PATH="/mingw64/lib/pkgconfig"
           go test ./...
 
       - name: Build
@@ -90,13 +90,12 @@ jobs:
 
       - name: Build (Windows)
         if: matrix.asset_os == 'windows'
-        shell: bash
+        shell: msys2 {0}
         run: |
-          export PATH="/c/msys64/mingw64/bin:$PATH"
-          export CC="x86_64-w64-mingw32-gcc"
           export CGO_ENABLED=1
-          export CGO_CFLAGS="-IC:/msys64/mingw64/include"
-          export CGO_LDFLAGS="-LC:/msys64/mingw64/lib"
+          export CC="gcc"
+          export CXX="g++"
+          export PKG_CONFIG_PATH="/mingw64/lib/pkgconfig"
           mkdir -p dist
           go build -trimpath -ldflags "-s -w" -o "dist/wave.exe" ./cmd/wave
 
