@@ -12,13 +12,15 @@ import (
 )
 
 type Freshness struct {
-	Status       string `json:"status"`
-	Dirty        bool   `json:"dirty"`
-	IndexedFiles int    `json:"indexed_files"`
-	CurrentFiles int    `json:"current_files"`
-	DirtyFiles   int    `json:"dirty_files"`
-	NewFiles     int    `json:"new_files"`
-	MissingFiles int    `json:"missing_files"`
+	Status       string  `json:"status"`
+	Dirty        bool    `json:"dirty"`
+	IndexedFiles int     `json:"indexed_files"`
+	CurrentFiles int     `json:"current_files"`
+	DirtyFiles   int     `json:"dirty_files"`
+	NewFiles     int     `json:"new_files"`
+	MissingFiles int     `json:"missing_files"`
+	ChangedFiles int     `json:"changed_files"`
+	ChangedRatio float64 `json:"changed_ratio"`
 }
 
 func ComputeFreshness(ctx context.Context, st *store.Store, adapter Adapter, unit workspace.Unit) (Freshness, error) {
@@ -69,6 +71,14 @@ func ComputeFreshness(ctx context.Context, st *store.Store, adapter Adapter, uni
 	result.Dirty = result.DirtyFiles > 0 || result.NewFiles > 0 || result.MissingFiles > 0
 	if result.Dirty {
 		result.Status = "stale"
+	}
+	result.ChangedFiles = result.DirtyFiles + result.NewFiles + result.MissingFiles
+	denominator := result.IndexedFiles
+	if result.CurrentFiles > denominator {
+		denominator = result.CurrentFiles
+	}
+	if denominator > 0 {
+		result.ChangedRatio = float64(result.ChangedFiles) / float64(denominator)
 	}
 	return result, nil
 }

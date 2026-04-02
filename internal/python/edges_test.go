@@ -14,7 +14,11 @@ func TestDeriveEdgesAddsReadWriteAndCallEdges(t *testing.T) {
 
 VALUE = dep.load()
 
+class Worker:
+    pass
+
 def run():
+    worker = Worker()
     current = VALUE
     dep.load()
     return current
@@ -73,56 +77,113 @@ def run():
 			},
 			{
 				FilePath:           "example.py",
-				Symbol:             "example.py/run().",
+				Symbol:             "example.py/Worker#",
 				StartLine:          4,
-				StartCol:           4,
-				EndLine:            7,
-				EndCol:             18,
+				StartCol:           0,
+				EndLine:            5,
+				EndCol:             8,
 				EnclosingStartLine: 4,
 				EnclosingStartCol:  0,
-				EnclosingEndLine:   7,
+				EnclosingEndLine:   5,
+				EnclosingEndCol:    8,
+				IsDefinition:       true,
+			},
+			{
+				FilePath:           "example.py",
+				Symbol:             "example.py/run().",
+				StartLine:          7,
+				StartCol:           4,
+				EndLine:            11,
+				EndCol:             18,
+				EnclosingStartLine: 7,
+				EnclosingStartCol:  0,
+				EnclosingEndLine:   11,
 				EnclosingEndCol:    18,
 				IsDefinition:       true,
 			},
 			{
 				FilePath:           "example.py",
-				Symbol:             "local current",
-				StartLine:          5,
+				Symbol:             "local worker",
+				StartLine:          8,
 				StartCol:           4,
-				EndLine:            5,
-				EndCol:             11,
-				EnclosingStartLine: 5,
+				EndLine:            8,
+				EndCol:             10,
+				EnclosingStartLine: 8,
 				EnclosingStartCol:  4,
-				EnclosingEndLine:   5,
+				EnclosingEndLine:   8,
+				EnclosingEndCol:    21,
+				IsDefinition:       true,
+				IsWrite:            true,
+			},
+			{
+				FilePath:           "example.py",
+				Symbol:             "example.py/Worker#",
+				StartLine:          8,
+				StartCol:           13,
+				EndLine:            8,
+				EndCol:             19,
+				EnclosingStartLine: 8,
+				EnclosingStartCol:  4,
+				EnclosingEndLine:   8,
+				EnclosingEndCol:    21,
+				IsRead:             true,
+			},
+			{
+				FilePath:           "example.py",
+				Symbol:             "local current",
+				StartLine:          9,
+				StartCol:           4,
+				EndLine:            9,
+				EndCol:             11,
+				EnclosingStartLine: 9,
+				EnclosingStartCol:  4,
+				EnclosingEndLine:   9,
 				EnclosingEndCol:    19,
+				IsDefinition:       true,
 				IsWrite:            true,
 			},
 			{
 				FilePath:           "example.py",
 				Symbol:             "local VALUE",
-				StartLine:          5,
+				StartLine:          9,
 				StartCol:           14,
-				EndLine:            5,
+				EndLine:            9,
 				EndCol:             19,
-				EnclosingStartLine: 5,
+				EnclosingStartLine: 9,
 				EnclosingStartCol:  4,
-				EnclosingEndLine:   5,
+				EnclosingEndLine:   9,
 				EnclosingEndCol:    19,
 				IsRead:             true,
 			},
 			{
 				FilePath:           "example.py",
 				Symbol:             "pkg dep/load().",
-				StartLine:          6,
+				StartLine:          10,
 				StartCol:           4,
-				EndLine:            6,
+				EndLine:            10,
 				EndCol:             12,
-				EnclosingStartLine: 6,
+				EnclosingStartLine: 10,
 				EnclosingStartCol:  4,
-				EnclosingEndLine:   6,
+				EnclosingEndLine:   10,
 				EnclosingEndCol:    14,
 				IsRead:             true,
 			},
+			{
+				FilePath:           "example.py",
+				Symbol:             "local current",
+				StartLine:          11,
+				StartCol:           11,
+				EndLine:            11,
+				EndCol:             18,
+				EnclosingStartLine: 11,
+				EnclosingStartCol:  4,
+				EnclosingEndLine:   11,
+				EnclosingEndCol:    18,
+				IsRead:             true,
+			},
+		},
+		Symbols: map[string]store.SymbolData{
+			"example.py/Worker#": {ScipSymbol: "example.py/Worker#", Kind: "class"},
 		},
 	}
 
@@ -135,6 +196,9 @@ def run():
 	assertEdge(t, edges, "example.py/run().", "local VALUE", "reads")
 	assertEdge(t, edges, "example.py/run().", "local current", "writes")
 	assertEdge(t, edges, "example.py/run().", "pkg dep/load().", "calls")
+	assertEdge(t, edges, "example.py/run().", "local current", "returns")
+	assertEdge(t, edges, "example.py/run().", "local current", "defines")
+	assertEdge(t, edges, "example.py/run().", "example.py/Worker#", "instantiates")
 }
 
 func toChunkData(chunks []syntax.Chunk) []store.ChunkData {

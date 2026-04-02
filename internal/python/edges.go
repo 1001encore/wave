@@ -42,6 +42,14 @@ func deriveEdges(ctx context.Context, req indexer.DeriveRequest) ([]store.EdgeDa
 			if enclosingSymbol == "" || enclosingSymbol == occ.Symbol || occ.Symbol == "" {
 				continue
 			}
+			if occ.IsDefinition && !occ.IsImport {
+				edges = append(edges, store.EdgeData{
+					SrcSymbol:  enclosingSymbol,
+					DstSymbol:  occ.Symbol,
+					Kind:       "defines",
+					Provenance: "hybrid",
+				})
+			}
 			if occ.IsWrite {
 				edges = append(edges, store.EdgeData{
 					SrcSymbol:  enclosingSymbol,
@@ -68,11 +76,17 @@ func deriveEdges(ctx context.Context, req indexer.DeriveRequest) ([]store.EdgeDa
 			}
 		}
 
-		derived, err := deriveCallEdges(ctx, filePath, source, req.Chunks, fileOccurrences[filePath])
+		derived, err := deriveCallEdges(ctx, filePath, source, req.Chunks, fileOccurrences[filePath], req.Symbols)
 		if err != nil {
 			return nil, err
 		}
 		edges = append(edges, derived...)
+
+		returnEdges, err := deriveReturnEdges(ctx, filePath, source, req.Chunks, fileOccurrences[filePath])
+		if err != nil {
+			return nil, err
+		}
+		edges = append(edges, returnEdges...)
 	}
 
 	sort.Slice(edges, func(i, j int) bool {
@@ -124,6 +138,7 @@ func deriveCallEdges(
 	source []byte,
 	chunks []store.ChunkData,
 	occurrences []store.OccurrenceData,
+	symbols map[string]store.SymbolData,
 ) ([]store.EdgeData, error) {
 	parser := tree_sitter.NewParser()
 	defer parser.Close()
@@ -153,10 +168,14 @@ func deriveCallEdges(
 			src := enclosingSymbolForNode(filePath, node, chunks)
 			dst := calleeSymbolForNode(node, occurrences)
 			if src != "" && dst != "" {
+				kind := "calls"
+				if symbol, ok := symbols[dst]; ok && symbol.Kind == "class" {
+					kind = "instantiates"
+				}
 				edges = append(edges, store.EdgeData{
 					SrcSymbol:  src,
 					DstSymbol:  dst,
-					Kind:       "calls",
+					Kind:       kind,
 					Provenance: "hybrid",
 				})
 			}
@@ -171,6 +190,82 @@ func deriveCallEdges(
 	}
 	visit(root)
 	return edges, nil
+}
+
+func deriveReturnEdges(
+	ctx context.Context,
+	filePath string,
+	source []byte,
+	chunks []store.ChunkData,
+	occurrences []store.OccurrenceData,
+) ([]store.EdgeData, error) {
+	parser := tree_sitter.NewParser()
+	defer parser.Close()
+
+	lang := tree_sitter.NewLanguage(tree_sitter_python.Language())
+	if err := parser.SetLanguage(lang); err != nil {
+		return nil, fmt.Errorf("set python grammar: %w", err)
+	}
+	tree := parser.ParseCtx(ctx, source, nil)
+	if tree == nil {
+		return nil, fmt.Errorf("parse %s for edge derivation: nil syntax tree", filePath)
+	}
+	defer tree.Close()
+
+	root := tree.RootNode()
+	if root == nil {
+		return nil, fmt.Errorf("parse %s for edge derivation: nil root node", filePath)
+	}
+
+	var edges []store.EdgeData
+	var visit func(*tree_sitter.Node)
+	visit = func(node *tree_sitter.Node) {
+		if node == nil {
+			return
+		}
+		if node.Kind() == "return_statement" {
+			src := enclosingSymbolForNode(filePath, node, chunks)
+			if src != "" {
+				for _, occ := range symbolsWithinNode(node, occurrences) {
+					edges = append(edges, store.EdgeData{
+						SrcSymbol:  src,
+						DstSymbol:  occ.Symbol,
+						Kind:       "returns",
+						Provenance: "hybrid",
+					})
+				}
+			}
+		}
+		cursor := node.Walk()
+		defer cursor.Close()
+		for _, child := range node.NamedChildren(cursor) {
+			childCopy := child
+			visit(&childCopy)
+		}
+	}
+	visit(root)
+	return edges, nil
+}
+
+func symbolsWithinNode(node *tree_sitter.Node, occurrences []store.OccurrenceData) []store.OccurrenceData {
+	start := node.StartPosition()
+	end := node.EndPosition()
+	seen := map[string]struct{}{}
+	out := make([]store.OccurrenceData, 0, 2)
+	for _, occ := range occurrences {
+		if occ.Symbol == "" || occ.IsDefinition || occ.IsImport || !occ.IsRead {
+			continue
+		}
+		if !rangeWithin(occ.StartLine, occ.StartCol, occ.EndLine, occ.EndCol, int(start.Row), int(start.Column), int(end.Row), int(end.Column)) {
+			continue
+		}
+		if _, ok := seen[occ.Symbol]; ok {
+			continue
+		}
+		seen[occ.Symbol] = struct{}{}
+		out = append(out, occ)
+	}
+	return out
 }
 
 func enclosingSymbolForNode(filePath string, node *tree_sitter.Node, chunks []store.ChunkData) string {

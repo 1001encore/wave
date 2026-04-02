@@ -211,20 +211,6 @@ func readONNXStderr(r io.Reader, dst *bytes.Buffer) {
 		line := scanner.Text()
 		dst.WriteString(line)
 		dst.WriteByte('\n')
-		if stat, ok := parseONNXBatchLine(line); ok {
-			fmt.Fprintf(
-				os.Stderr,
-				"embed_batch #%d size=%d processed=%d tokenize=%.1f infer=%.1f normalize=%.1f retries=%d settled=%d\n",
-				stat.Index,
-				stat.Size,
-				stat.Processed,
-				stat.TokenizeMS,
-				stat.InferMS,
-				stat.NormalizeMS,
-				stat.RetryCount,
-				stat.SettledBatch,
-			)
-		}
 	}
 }
 
