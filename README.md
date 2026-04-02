@@ -1,8 +1,8 @@
 # wave
 
-Code intelligence CLI for Python and TypeScript projects.
+Code intelligence tool that combines SCIP graphs, Tree-sitter and vector embeddings.
 
-`wave` indexes your codebase once, then gives fast symbol + semantic + graph retrieval from the terminal.
+`wave` indexes your codebase, then gives fast symbol + semantic + graph retrieval from the terminal.
 
 ## Install
 
