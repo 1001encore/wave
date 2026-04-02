@@ -27,6 +27,8 @@ def select_execution_providers(device: str = "") -> list[str]:
     if device in ("cuda", "gpu"):
         available = set(ort.get_available_providers())
         if "CUDAExecutionProvider" not in available:
+            if "CPUExecutionProvider" in available:
+                return ["CPUExecutionProvider"]
             raise RuntimeError(
                 f"CUDAExecutionProvider requested but not available; available={sorted(available)}"
             )

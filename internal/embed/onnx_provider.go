@@ -287,7 +287,7 @@ func ResolveONNXProvider(rootDir string, device string) (Provider, error) {
 		return nil, err
 	}
 
-	pythonPath, err := resolvePythonPath(searchRoots)
+	pythonPath, err := resolvePythonPath(searchRoots, device)
 	if err != nil {
 		return nil, err
 	}
@@ -399,7 +399,7 @@ func resolveModelDir(searchRoots []string) (string, error) {
 	return target, nil
 }
 
-func resolvePythonPath(searchRoots []string) (string, error) {
+func resolvePythonPath(searchRoots []string, device string) (string, error) {
 	if override := strings.TrimSpace(os.Getenv(embedPythonEnv)); override != "" {
 		if !fileExists(override) {
 			return "", fmt.Errorf("%s is set but file does not exist: %s", embedPythonEnv, override)
@@ -419,13 +419,13 @@ func resolvePythonPath(searchRoots []string) (string, error) {
 		if err := ensurePythonDeps(path); err == nil {
 			return path, nil
 		}
-		return ensureEmbeddedRuntime(path)
+		return ensureEmbeddedRuntime(path, device)
 	}
 	if path, err := exec.LookPath("python"); err == nil {
 		if err := ensurePythonDeps(path); err == nil {
 			return path, nil
 		}
-		return ensureEmbeddedRuntime(path)
+		return ensureEmbeddedRuntime(path, device)
 	}
 	return "", fmt.Errorf("python runtime not found; expected project .venv/bin/python or python3 on PATH")
 }
@@ -565,7 +565,7 @@ func ensurePythonDeps(pythonPath string) error {
 	return nil
 }
 
-func ensureEmbeddedRuntime(basePython string) (string, error) {
+func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 	cacheDir, err := userCacheDir()
 	if err != nil {
 		return "", err
@@ -586,9 +586,22 @@ func ensureEmbeddedRuntime(basePython string) (string, error) {
 		}
 	}
 
-	cmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "numpy", "onnxruntime", "tokenizers")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("install embedding runtime dependencies: %w\n%s", err, strings.TrimSpace(string(output)))
+	packages := []string{"onnxruntime"}
+	if device == "cuda" || device == "gpu" {
+		packages = []string{"onnxruntime-gpu", "onnxruntime"}
+	}
+	var installErr error
+	for _, onnxPackage := range packages {
+		cmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "numpy", onnxPackage, "tokenizers")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w\n%s", onnxPackage, err, strings.TrimSpace(string(output)))
+			continue
+		}
+		installErr = nil
+		break
+	}
+	if installErr != nil {
+		return "", installErr
 	}
 	if err := ensurePythonDeps(runtimePython); err != nil {
 		return "", err
