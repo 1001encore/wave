@@ -24,7 +24,7 @@ jobs:
             goarch: arm64
             exe: ""
             archive: tar.gz
-          - os: macos-13
+          - os: macos-latest
             asset_os: darwin
             goarch: amd64
             exe: ""
