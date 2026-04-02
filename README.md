@@ -21,19 +21,21 @@ Download the latest release from [GitHub Releases](https://github.com/1001encore
 #### One-line install (Windows PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/1001encore/wave/main/scripts/install.ps1 | iex
+gh api repos/1001encore/wave/contents/scripts/install.ps1?ref=main --jq .content | % { [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($_)) } | iex
 ```
 
 #### One-line install (Linux Bash)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/1001encore/wave/main/scripts/install.sh | sh
+gh api repos/1001encore/wave/contents/scripts/install.sh?ref=main --jq .content | base64 -d | sh
 ```
 
 Scripts used by the commands above:
 
 - `scripts/install.ps1`
 - `scripts/install.sh`
+
+Note: raw.githubusercontent.com links work only for public repos. This repo is private, so use the `gh api` commands above.
 
 ```bash
 # Example: Linux amd64
