@@ -67,8 +67,8 @@ type onnxBatchStat struct {
 }
 
 const (
-	embedModelName  = "all-MiniLM-L6-v2"
-	embedModelRepo  = "optimum/all-MiniLM-L6-v2"
+	embedModelName  = "all-MiniLM-L6-v2-code-search-512"
+	embedModelRepo  = "isuruwijesiri/all-MiniLM-L6-v2-code-search-512"
 	embedModelEnv   = "WAVE_EMBED_MODEL_DIR"
 	embedCacheEnv   = "WAVE_EMBED_CACHE_DIR"
 	embedPythonEnv  = "WAVE_EMBED_PYTHON"
@@ -76,14 +76,28 @@ const (
 	embedScriptName = "embed_onnx.py"
 )
 
-var embedModelFiles = []string{
+var embedModelRequiredFiles = []string{
 	"config.json",
 	"tokenizer.json",
 	"tokenizer_config.json",
 	"special_tokens_map.json",
 	"vocab.txt",
 	"README.md",
+}
+
+var embedModelDownloadFiles = []string{
+	"config.json",
+	"tokenizer.json",
+	"tokenizer_config.json",
+	"special_tokens_map.json",
+	"vocab.txt",
+	"README.md",
+	"onnx/model.onnx",
+}
+
+var embedModelONNXCandidates = []string{
 	"model.onnx",
+	"onnx/model.onnx",
 }
 
 //go:embed assets/embed_onnx.py
@@ -458,14 +472,20 @@ func ensureEmbeddedScript() (string, error) {
 }
 
 func ensureModelFiles(modelDir string) error {
-	for _, rel := range embedModelFiles {
+	for _, rel := range embedModelRequiredFiles {
 		path := filepath.Join(modelDir, rel)
 		info, err := os.Stat(path)
 		if err != nil || info.IsDir() {
 			return fmt.Errorf("embedding model is incomplete; missing %s", path)
 		}
 	}
-	return nil
+	for _, rel := range embedModelONNXCandidates {
+		path := filepath.Join(modelDir, rel)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			return nil
+		}
+	}
+	return fmt.Errorf("embedding model is incomplete; missing %s or %s", filepath.Join(modelDir, "model.onnx"), filepath.Join(modelDir, "onnx", "model.onnx"))
 }
 
 func downloadModel(modelDir string) error {
@@ -474,7 +494,7 @@ func downloadModel(modelDir string) error {
 	}
 
 	client := &http.Client{}
-	for _, rel := range embedModelFiles {
+	for _, rel := range embedModelDownloadFiles {
 		targetPath := filepath.Join(modelDir, rel)
 		if info, err := os.Stat(targetPath); err == nil && !info.IsDir() {
 			continue
