@@ -72,6 +72,8 @@ wave refs processData
 - `--limit <n>`
 - `--explain`
 - `--device cpu|cuda` (default: `cuda`)
+- `wave search --show-score` — include raw rerank score per hit
+- `wave search --show-softmax` — include softmax probability per hit (relative within returned hits)
 
 ## Requirements
 

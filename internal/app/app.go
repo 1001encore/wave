@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -274,6 +275,10 @@ func runStatus(ctx context.Context, args []string) int {
 func runSearch(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	cc := bindCommonFlags(fs)
+	var showScore bool
+	var showSoftmax bool
+	fs.BoolVar(&showScore, "show-score", false, "include raw rerank scores in output")
+	fs.BoolVar(&showSoftmax, "show-softmax", false, "include softmax probabilities over returned hits (relative within this result set)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -302,11 +307,7 @@ func runSearch(ctx context.Context, args []string) int {
 	}
 	printFreshnessWarning(ctx, st, units, cc)
 	if cc.jsonOut {
-		if cc.explain {
-			printJSON(result)
-		} else {
-			printJSON(result.Hits)
-		}
+		printJSON(searchJSONPayload(result, showScore, showSoftmax, cc.explain))
 		return 0
 	}
 
@@ -314,11 +315,26 @@ func runSearch(ctx context.Context, args []string) int {
 		fmt.Println("No matches.")
 		return 0
 	}
+	var softmax []float64
+	if showSoftmax {
+		softmax = softmaxProbabilities(result.Hits)
+	}
 	if cc.explain {
 		fmt.Printf("Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
 	}
 	fmt.Printf("Matches: %d\n", len(result.Hits))
 	for i, hit := range result.Hits {
+		summary := firstNonEmpty(hit.Name, hit.HeaderText)
+		if showScore || showSoftmax {
+			parts := make([]string, 0, 2)
+			if showScore {
+				parts = append(parts, fmt.Sprintf("score=%.3f", hit.Score))
+			}
+			if showSoftmax {
+				parts = append(parts, fmt.Sprintf("softmax=%.4f", softmax[i]))
+			}
+			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
+		}
 		fmt.Printf(
 			"%d. %s:%d-%d  [%s]  %s\n",
 			i+1,
@@ -326,7 +342,7 @@ func runSearch(ctx context.Context, args []string) int {
 			hit.StartLine+1,
 			hit.EndLine+1,
 			hit.Kind,
-			firstNonEmpty(hit.Name, hit.HeaderText),
+			summary,
 		)
 		snippet := truncate(hit.HeaderText, 200)
 		if snippet != "" {
@@ -1869,6 +1885,103 @@ func printJSON(payload any) {
 		return
 	}
 	fmt.Println(string(encoded))
+}
+
+type searchHitOutput struct {
+	ChunkID            int64    `json:"chunk_id"`
+	FileID             int64    `json:"file_id"`
+	PrimarySymbolID    int64    `json:"primary_symbol_id"`
+	Path               string   `json:"path"`
+	StartLine          int      `json:"start_line"`
+	EndLine            int      `json:"end_line"`
+	Kind               string   `json:"kind"`
+	Name               string   `json:"name"`
+	HeaderText         string   `json:"header_text"`
+	Text               string   `json:"text"`
+	Score              *float64 `json:"score,omitempty"`
+	SoftmaxProbability *float64 `json:"softmax_probability,omitempty"`
+}
+
+type searchResultOutput struct {
+	Plan queryrouter.Plan  `json:"plan"`
+	Hits []searchHitOutput `json:"hits"`
+}
+
+func searchJSONPayload(result queryrouter.SearchResult, includeScore bool, includeSoftmax bool, explain bool) any {
+	hits := searchHitsOutput(result.Hits, includeScore, includeSoftmax)
+	if explain {
+		return searchResultOutput{
+			Plan: result.Plan,
+			Hits: hits,
+		}
+	}
+	return hits
+}
+
+func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax bool) []searchHitOutput {
+	out := make([]searchHitOutput, 0, len(hits))
+	var softmax []float64
+	if includeSoftmax {
+		softmax = softmaxProbabilities(hits)
+	}
+	for i, hit := range hits {
+		item := searchHitOutput{
+			ChunkID:         hit.ChunkID,
+			FileID:          hit.FileID,
+			PrimarySymbolID: hit.PrimarySymbolID,
+			Path:            hit.Path,
+			StartLine:       hit.StartLine,
+			EndLine:         hit.EndLine,
+			Kind:            hit.Kind,
+			Name:            hit.Name,
+			HeaderText:      hit.HeaderText,
+			Text:            hit.Text,
+		}
+		if includeScore {
+			score := hit.Score
+			item.Score = &score
+		}
+		if includeSoftmax {
+			prob := softmax[i]
+			item.SoftmaxProbability = &prob
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
+func softmaxProbabilities(hits []store.SearchHit) []float64 {
+	if len(hits) == 0 {
+		return nil
+	}
+	maxScore := hits[0].Score
+	for _, hit := range hits[1:] {
+		if hit.Score > maxScore {
+			maxScore = hit.Score
+		}
+	}
+
+	weights := make([]float64, len(hits))
+	total := 0.0
+	for i, hit := range hits {
+		w := math.Exp(hit.Score - maxScore)
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			w = 0
+		}
+		weights[i] = w
+		total += w
+	}
+	if total <= 0 {
+		uniform := 1.0 / float64(len(weights))
+		for i := range weights {
+			weights[i] = uniform
+		}
+		return weights
+	}
+	for i := range weights {
+		weights[i] /= total
+	}
+	return weights
 }
 
 func adapterByID(id string) indexer.Adapter {

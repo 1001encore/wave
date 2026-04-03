@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"flag"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -284,5 +285,87 @@ func TestDefinitionJSONPayloadIncludesCandidatesByDefault(t *testing.T) {
 	}
 	if len(got.Candidates) != 2 {
 		t.Fatalf("candidate count = %d, want 2", len(got.Candidates))
+	}
+}
+
+func TestSearchHitsOutputOmitsScoresByDefault(t *testing.T) {
+	hits := []store.SearchHit{
+		{
+			ChunkID:         7,
+			FileID:          11,
+			PrimarySymbolID: 13,
+			Path:            "/tmp/a.go",
+			StartLine:       1,
+			EndLine:         2,
+			Kind:            "function_definition",
+			Name:            "run",
+			HeaderText:      "func run()",
+			Text:            "func run() {}",
+			Score:           85.0,
+		},
+	}
+
+	out := searchHitsOutput(hits, false, false)
+	if len(out) != 1 {
+		t.Fatalf("hit count = %d, want 1", len(out))
+	}
+	if out[0].Score != nil {
+		t.Fatalf("score should be omitted by default, got %v", *out[0].Score)
+	}
+	if out[0].SoftmaxProbability != nil {
+		t.Fatalf("softmax_probability should be omitted by default, got %v", *out[0].SoftmaxProbability)
+	}
+}
+
+func TestSearchHitsOutputIncludesRawAndSoftmaxWhenEnabled(t *testing.T) {
+	hits := []store.SearchHit{
+		{ChunkID: 1, Score: 3.0},
+		{ChunkID: 2, Score: 1.0},
+		{ChunkID: 3, Score: 0.2},
+	}
+
+	out := searchHitsOutput(hits, true, true)
+	if len(out) != 3 {
+		t.Fatalf("hit count = %d, want 3", len(out))
+	}
+	if out[0].Score == nil || *out[0].Score != 3.0 {
+		t.Fatalf("first raw score = %#v, want 3.0", out[0].Score)
+	}
+	if out[0].SoftmaxProbability == nil {
+		t.Fatal("first softmax probability should be populated")
+	}
+	if out[1].SoftmaxProbability == nil || out[2].SoftmaxProbability == nil {
+		t.Fatal("softmax probability should be populated for all hits")
+	}
+	if *out[0].SoftmaxProbability <= *out[1].SoftmaxProbability || *out[1].SoftmaxProbability <= *out[2].SoftmaxProbability {
+		t.Fatalf(
+			"expected descending softmax probabilities, got %.6f %.6f %.6f",
+			*out[0].SoftmaxProbability,
+			*out[1].SoftmaxProbability,
+			*out[2].SoftmaxProbability,
+		)
+	}
+}
+
+func TestSoftmaxProbabilitiesNormalizeAndStayRelative(t *testing.T) {
+	hits := []store.SearchHit{
+		{Score: 3.0},
+		{Score: 1.0},
+		{Score: 0.2},
+	}
+
+	got := softmaxProbabilities(hits)
+	if len(got) != len(hits) {
+		t.Fatalf("probability count = %d, want %d", len(got), len(hits))
+	}
+	sum := 0.0
+	for _, p := range got {
+		sum += p
+	}
+	if math.Abs(sum-1.0) > 1e-9 {
+		t.Fatalf("probability sum = %.12f, want 1.0", sum)
+	}
+	if got[0] < 0.80 || got[0] > 0.90 {
+		t.Fatalf("first probability = %.6f, expected near 0.83 for 3/1/0.2 inputs", got[0])
 	}
 }

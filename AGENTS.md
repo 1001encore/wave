@@ -64,6 +64,14 @@ wave search --mode semantic "retry with exponential backoff"
 wave search --mode graph "PaymentService"
 ```
 
+Expose score fields only when needed:
+
+```bash
+wave search --show-score "Router"
+wave search --show-softmax "auth middleware"
+wave search --json --show-score --show-softmax "handleRequest"
+```
+
 ## Practical Tips
 
 - Prefer `wave context --json` when you need a single, rich payload.
