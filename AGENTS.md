@@ -2,6 +2,16 @@
 
 Use `wave` as a fast code-intelligence layer over an indexed project.
 
+## Supported Languages
+
+| Language | Adapter ID | SCIP indexer | Auto-install path |
+| --- | --- | --- | --- |
+| Go | `go-scip` | `scip-go` | `go install` |
+| Java | `java-scip` | `scip-java` | `coursier` (`cs`/`coursier`) |
+| Python | `python-scip` | `scip-python` | `npm` |
+| Rust | `rust-scip` | `rust-analyzer` (`scip`) | `rustup component add rust-analyzer` |
+| TypeScript / JavaScript | `typescript-scip` | `scip-typescript` | `npm` |
+
 ## Default Workflow
 
 1. Ensure the project is indexed:
@@ -21,11 +31,21 @@ wave context "query"
 
 ## Command Intent
 
-- `search` — best for discovery (identifier or natural language)
-- `def` — precise symbol definition lookup
-- `refs` — symbol usage map
-- `context` — compact local neighborhood (seed + neighbors + graph + refs)
-- `status` — index freshness and counts
+- `search` — discovery across identifiers and natural-language semantic intent.
+- `def` — precise definition lookup from symbol identity.
+- `refs` — symbol usage map for the resolved symbol.
+- `context` — compact local neighborhood (seed + neighbors + graph + refs).
+- `status` — index freshness and counts.
+
+## Retrieval Modes
+
+`search` and `context` support `--mode auto|hybrid|symbol|semantic|graph`:
+
+- `auto` (default): picks symbol-heavy routing for identifier-like queries, and semantic+symbol hybrid for natural-language queries.
+- `hybrid`: mixes symbol/semantic/graph signals.
+- `symbol`: symbol-oriented matching.
+- `semantic`: embedding-based natural-language retrieval.
+- `graph`: relationship/edge-oriented retrieval.
 
 ## Modes and JSON
 

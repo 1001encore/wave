@@ -68,8 +68,8 @@ func TestDeriveChunkSymbolLinksIncludesPrimaryAndOccurrenceRoles(t *testing.T) {
 	}
 }
 
-func TestDetectWorkspaceUnitsFindsPythonAndTypeScriptInSameRoot(t *testing.T) {
-	root, err := filepath.Abs(filepath.Join("..", "..", "testdata", "samplepoly"))
+func TestDetectWorkspaceUnitsIncludesPythonAndTypeScriptInMixedRoot(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "testdata", "sampleall"))
 	if err != nil {
 		t.Fatalf("resolve fixture path: %v", err)
 	}
@@ -81,8 +81,8 @@ func TestDetectWorkspaceUnitsFindsPythonAndTypeScriptInSameRoot(t *testing.T) {
 	if detectedRoot != root {
 		t.Fatalf("detected root = %q, want %q", detectedRoot, root)
 	}
-	if len(units) != 2 {
-		t.Fatalf("unit count = %d, want 2", len(units))
+	if len(units) < 2 {
+		t.Fatalf("unit count = %d, want at least 2", len(units))
 	}
 
 	found := map[string]bool{}
@@ -91,6 +91,49 @@ func TestDetectWorkspaceUnitsFindsPythonAndTypeScriptInSameRoot(t *testing.T) {
 	}
 	if !found["python"] || !found["typescript"] {
 		t.Fatalf("detected languages = %#v, want python+typescript", found)
+	}
+}
+
+func TestDetectWorkspaceUnitsFindsAllSupportedLanguagesInSameRoot(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "testdata", "sampleall"))
+	if err != nil {
+		t.Fatalf("resolve fixture path: %v", err)
+	}
+
+	detectedRoot, units, err := detectWorkspaceUnits(root)
+	if err != nil {
+		t.Fatalf("detect workspace units: %v", err)
+	}
+	if detectedRoot != root {
+		t.Fatalf("detected root = %q, want %q", detectedRoot, root)
+	}
+	if len(units) != 5 {
+		t.Fatalf("unit count = %d, want 5", len(units))
+	}
+
+	found := map[string]bool{}
+	for _, item := range units {
+		found[item.Unit.Language] = true
+	}
+	for _, want := range []string{"go", "java", "python", "rust", "typescript"} {
+		if !found[want] {
+			t.Fatalf("missing language %q in detected set %#v", want, found)
+		}
+	}
+}
+
+func TestDetectWorkspaceUnitsPrefersMoreSpecificRootOnTie(t *testing.T) {
+	root, err := filepath.Abs(filepath.Join("..", "..", "testdata", "samplejava"))
+	if err != nil {
+		t.Fatalf("resolve fixture path: %v", err)
+	}
+
+	detectedRoot, _, err := detectWorkspaceUnits(root)
+	if err != nil {
+		t.Fatalf("detect workspace units: %v", err)
+	}
+	if detectedRoot != root {
+		t.Fatalf("detected root = %q, want %q", detectedRoot, root)
 	}
 }
 
@@ -121,13 +164,17 @@ func TestBindCommonFlagsWithLimitOverridesDefault(t *testing.T) {
 
 func TestIndexerInstallSpecForAdapter(t *testing.T) {
 	tests := []struct {
-		adapterID string
-		wantBin   string
-		wantPkg   string
-		wantOK    bool
+		adapterID  string
+		wantBin    string
+		wantMethod string
+		wantPkg    string
+		wantOK     bool
 	}{
-		{adapterID: "python-scip", wantBin: "scip-python", wantPkg: "@sourcegraph/scip-python", wantOK: true},
-		{adapterID: "typescript-scip", wantBin: "scip-typescript", wantPkg: "@sourcegraph/scip-typescript", wantOK: true},
+		{adapterID: "python-scip", wantBin: "scip-python", wantMethod: "npm", wantPkg: "@sourcegraph/scip-python", wantOK: true},
+		{adapterID: "typescript-scip", wantBin: "scip-typescript", wantMethod: "npm", wantPkg: "@sourcegraph/scip-typescript", wantOK: true},
+		{adapterID: "go-scip", wantBin: "scip-go", wantMethod: "go-install", wantOK: true},
+		{adapterID: "rust-scip", wantBin: "rust-analyzer", wantMethod: "rustup-component", wantOK: true},
+		{adapterID: "java-scip", wantBin: "scip-java", wantMethod: "coursier-bootstrap", wantOK: true},
 		{adapterID: "unknown", wantOK: false},
 	}
 
@@ -141,6 +188,9 @@ func TestIndexerInstallSpecForAdapter(t *testing.T) {
 		}
 		if got.Binary != tt.wantBin {
 			t.Fatalf("adapter %q: binary = %q, want %q", tt.adapterID, got.Binary, tt.wantBin)
+		}
+		if got.Method != tt.wantMethod {
+			t.Fatalf("adapter %q: method = %q, want %q", tt.adapterID, got.Method, tt.wantMethod)
 		}
 		if got.NPMPackage != tt.wantPkg {
 			t.Fatalf("adapter %q: npm package = %q, want %q", tt.adapterID, got.NPMPackage, tt.wantPkg)

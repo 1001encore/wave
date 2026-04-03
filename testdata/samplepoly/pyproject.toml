@@ -1,5 +1,0 @@
-[project]
-name = "samplepoly"
-version = "0.1.0"
-description = "Mixed Python and TypeScript test workspace"
-requires-python = ">=3.10"

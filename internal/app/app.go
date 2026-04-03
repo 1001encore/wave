@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,9 +22,12 @@ import (
 	"github.com/1001encore/wave/internal/config"
 	"github.com/1001encore/wave/internal/embed"
 	scip "github.com/1001encore/wave/internal/gen/scippb"
+	"github.com/1001encore/wave/internal/golang"
 	"github.com/1001encore/wave/internal/indexer"
+	"github.com/1001encore/wave/internal/java"
 	"github.com/1001encore/wave/internal/python"
 	queryrouter "github.com/1001encore/wave/internal/query"
+	"github.com/1001encore/wave/internal/rust"
 	"github.com/1001encore/wave/internal/scipgraph"
 	"github.com/1001encore/wave/internal/store"
 	"github.com/1001encore/wave/internal/typescript"
@@ -68,8 +72,12 @@ type indexTotals struct {
 }
 
 type indexerInstallSpec struct {
-	Binary     string
-	NPMPackage string
+	Binary             string
+	Method             string
+	NPMPackage         string
+	GoModule           string
+	RustupComponent    string
+	CoursierCoordinate string
 }
 
 const (
@@ -83,7 +91,10 @@ const (
 
 func adapters() []indexer.Adapter {
 	return []indexer.Adapter{
+		golang.Adapter{},
+		java.Adapter{},
 		python.Adapter{},
+		rust.Adapter{},
 		typescript.Adapter{},
 	}
 }
@@ -604,7 +615,7 @@ func detectWorkspaceUnits(start string) (string, []indexer.DetectedUnit, error) 
 	for _, item := range detected[1:] {
 		root := item.Unit.RootPath
 		count := rootCounts[root]
-		if count > bestCount || (count == bestCount && len(root) < len(bestRoot)) {
+		if count > bestCount || (count == bestCount && len(root) > len(bestRoot)) {
 			bestRoot = root
 			bestCount = count
 		}
@@ -666,14 +677,34 @@ func artifactSuffix(adapterID string) string {
 
 func indexerInstallSpecForAdapter(adapterID string) (indexerInstallSpec, bool) {
 	switch strings.TrimSpace(strings.ToLower(adapterID)) {
+	case "go-scip":
+		return indexerInstallSpec{
+			Binary:   "scip-go",
+			Method:   "go-install",
+			GoModule: "github.com/sourcegraph/scip-go/cmd/scip-go@latest",
+		}, true
+	case "java-scip":
+		return indexerInstallSpec{
+			Binary:             "scip-java",
+			Method:             "coursier-bootstrap",
+			CoursierCoordinate: "com.sourcegraph:scip-java_2.13:latest.release",
+		}, true
 	case "python-scip":
 		return indexerInstallSpec{
 			Binary:     "scip-python",
+			Method:     "npm",
 			NPMPackage: "@sourcegraph/scip-python",
+		}, true
+	case "rust-scip":
+		return indexerInstallSpec{
+			Binary:          "rust-analyzer",
+			Method:          "rustup-component",
+			RustupComponent: "rust-analyzer",
 		}, true
 	case "typescript-scip":
 		return indexerInstallSpec{
 			Binary:     "scip-typescript",
+			Method:     "npm",
 			NPMPackage: "@sourcegraph/scip-typescript",
 		}, true
 	default:
@@ -698,35 +729,209 @@ func ensureIndexerDependencies(ctx context.Context, units []indexer.DetectedUnit
 	}
 
 	for _, plan := range plans {
-		if _, err := exec.LookPath(plan.Binary); err == nil {
+		if binaryInstalledAndUsable(ctx, plan) {
 			continue
 		}
-		if _, err := exec.LookPath("npm"); err != nil {
-			return fmt.Errorf(
-				"%s is required but not found, and npm is unavailable to install it: %w",
-				plan.Binary,
-				err,
-			)
-		}
 		if !jsonOut {
-			fmt.Fprintf(os.Stderr, "info: %s not found; installing %s via npm\n", plan.Binary, plan.NPMPackage)
+			fmt.Fprintf(os.Stderr, "info: %s not found; installing via %s\n", plan.Binary, plan.Method)
 		}
-		cmd := exec.CommandContext(ctx, "npm", "install", "-g", plan.NPMPackage)
-		output, err := cmd.CombinedOutput()
+		var err error
+		switch plan.Method {
+		case "npm":
+			err = installIndexerWithNPM(ctx, plan)
+		case "go-install":
+			err = installIndexerWithGo(ctx, plan)
+		case "rustup-component":
+			err = installIndexerWithRustup(ctx, plan)
+		case "coursier-bootstrap":
+			err = installIndexerWithCoursier(ctx, plan)
+		default:
+			err = fmt.Errorf("unsupported install method %q", plan.Method)
+		}
 		if err != nil {
-			return fmt.Errorf(
-				"install %s (%s): %w\n%s",
-				plan.Binary,
-				plan.NPMPackage,
-				err,
-				strings.TrimSpace(string(output)),
-			)
+			return err
 		}
+
 		if _, err := exec.LookPath(plan.Binary); err != nil {
-			return fmt.Errorf("%s still not found on PATH after installation", plan.Binary)
+			return fmt.Errorf("%s still not found on PATH after installation (method=%s)", plan.Binary, plan.Method)
 		}
 	}
 	return nil
+}
+
+func binaryInstalledAndUsable(ctx context.Context, plan indexerInstallSpec) bool {
+	if _, err := exec.LookPath(plan.Binary); err != nil {
+		return false
+	}
+	if plan.Method != "rustup-component" {
+		return true
+	}
+
+	cmd := exec.CommandContext(ctx, plan.Binary, "--version")
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+func installIndexerWithNPM(ctx context.Context, plan indexerInstallSpec) error {
+	if _, err := exec.LookPath("npm"); err != nil {
+		return fmt.Errorf("%s is required but not found, and npm is unavailable to install it: %w", plan.Binary, err)
+	}
+	cmd := exec.CommandContext(ctx, "npm", "install", "-g", plan.NPMPackage)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"install %s (%s): %w\n%s",
+			plan.Binary,
+			plan.NPMPackage,
+			err,
+			strings.TrimSpace(string(output)),
+		)
+	}
+	return nil
+}
+
+func installIndexerWithGo(ctx context.Context, plan indexerInstallSpec) error {
+	if _, err := exec.LookPath("go"); err != nil {
+		return fmt.Errorf("%s is required but not found, and go is unavailable to install it: %w", plan.Binary, err)
+	}
+
+	cmd := exec.CommandContext(ctx, "go", "install", plan.GoModule)
+	if binDir, err := preferredUserBinDir(); err == nil && binDir != "" {
+		if mkErr := os.MkdirAll(binDir, 0o755); mkErr == nil {
+			cmd.Env = append(os.Environ(), "GOBIN="+binDir)
+			prependPath(binDir)
+		}
+	}
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"install %s (%s): %w\n%s",
+			plan.Binary,
+			plan.GoModule,
+			err,
+			strings.TrimSpace(string(output)),
+		)
+	}
+	return nil
+}
+
+func installIndexerWithRustup(ctx context.Context, plan indexerInstallSpec) error {
+	if _, err := exec.LookPath("rustup"); err != nil {
+		return fmt.Errorf("%s is required but not found, and rustup is unavailable to install it: %w", plan.Binary, err)
+	}
+
+	cmd := exec.CommandContext(ctx, "rustup", "component", "add", plan.RustupComponent)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"install %s (rustup component %s): %w\n%s",
+			plan.Binary,
+			plan.RustupComponent,
+			err,
+			strings.TrimSpace(string(output)),
+		)
+	}
+
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		prependPath(filepath.Join(home, ".cargo", "bin"))
+	}
+	return nil
+}
+
+func installIndexerWithCoursier(ctx context.Context, plan indexerInstallSpec) error {
+	coursierBin, err := resolveCoursierBinary()
+	if err != nil {
+		return fmt.Errorf(
+			"%s is required but not found, and coursier is unavailable to install it: %w",
+			plan.Binary,
+			err,
+		)
+	}
+	binDir, err := preferredUserBinDir()
+	if err != nil {
+		return fmt.Errorf("resolve install dir for %s: %w", plan.Binary, err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		return fmt.Errorf("create install dir %s: %w", binDir, err)
+	}
+	binaryName := plan.Binary
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	destination := filepath.Join(binDir, binaryName)
+	cmd := exec.CommandContext(
+		ctx,
+		coursierBin,
+		"bootstrap",
+		"--standalone",
+		"-o",
+		destination,
+		plan.CoursierCoordinate,
+		"--main",
+		"com.sourcegraph.scip_java.ScipJava",
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"install %s (%s): %w\n%s",
+			plan.Binary,
+			plan.CoursierCoordinate,
+			err,
+			strings.TrimSpace(string(output)),
+		)
+	}
+	prependPath(binDir)
+	return nil
+}
+
+func resolveCoursierBinary() (string, error) {
+	for _, candidate := range []string{"cs", "coursier"} {
+		if path, err := exec.LookPath(candidate); err == nil {
+			return path, nil
+		}
+	}
+	return "", fmt.Errorf("neither %q nor %q is available on PATH", "cs", "coursier")
+}
+
+func preferredUserBinDir() (string, error) {
+	if runtime.GOOS == "windows" {
+		if local := strings.TrimSpace(os.Getenv("LOCALAPPDATA")); local != "" {
+			return filepath.Join(local, "wave", "bin"), nil
+		}
+		if profile := strings.TrimSpace(os.Getenv("USERPROFILE")); profile != "" {
+			return filepath.Join(profile, "AppData", "Local", "wave", "bin"), nil
+		}
+		return "", fmt.Errorf("LOCALAPPDATA is not set")
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".local", "bin"), nil
+}
+
+func prependPath(dir string) {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return
+	}
+	current := os.Getenv("PATH")
+	sep := string(os.PathListSeparator)
+	parts := strings.Split(current, sep)
+	for _, part := range parts {
+		if filepath.Clean(part) == filepath.Clean(dir) {
+			return
+		}
+	}
+	if current == "" {
+		_ = os.Setenv("PATH", dir)
+		return
+	}
+	_ = os.Setenv("PATH", dir+sep+current)
 }
 
 func performIndex(ctx context.Context, cc *commandContext) (map[string]any, string, error) {
