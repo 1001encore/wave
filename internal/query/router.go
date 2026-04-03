@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strings"
@@ -13,6 +14,17 @@ import (
 )
 
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_./:#()\-]*$`)
+
+const (
+	semanticCandidateMultiplier        = 6
+	semanticMinCandidatePool           = 60
+	semanticMaxCandidatePool           = 200
+	semanticSimilarityAbsoluteFloor    = 0.20
+	semanticSimilarityRelativeFloor    = 0.70
+	semanticSingleTokenConfidenceFloor = 0.55
+	semanticMultiTokenConfidenceFloor  = 0.44
+	scoreSoftmaxTemperature            = 4.0
+)
 
 type QueryMode string
 
@@ -95,6 +107,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 			semantic:       true,
 			graphExpand:    false,
 			lexicalChunks:  false,
+			confidenceGate: false,
 		})
 	case QueryModeSemantic:
 		return r.runSearch(ctx, rootPath, query, limit, mode, "semantic retrieval was explicitly requested", searchOptions{
@@ -103,6 +116,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 			semantic:       true,
 			graphExpand:    false,
 			lexicalChunks:  false,
+			confidenceGate: false,
 		})
 	case QueryModeGraph:
 		return r.runSearch(ctx, rootPath, query, limit, mode, "graph retrieval was explicitly requested", searchOptions{
@@ -111,6 +125,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 			semantic:       true,
 			graphExpand:    true,
 			lexicalChunks:  false,
+			confidenceGate: false,
 		})
 	case QueryModeHybrid:
 		return r.runSearch(ctx, rootPath, query, limit, mode, "hybrid retrieval was explicitly requested", searchOptions{
@@ -119,6 +134,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 			semantic:       true,
 			graphExpand:    true,
 			lexicalChunks:  true,
+			confidenceGate: false,
 		})
 	case QueryModeAuto:
 		if isIdentifierLike(query) {
@@ -128,6 +144,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 				semantic:       true,
 				graphExpand:    true,
 				lexicalChunks:  true,
+				confidenceGate: true,
 			})
 		}
 		return r.runSearch(ctx, rootPath, query, limit, QueryModeHybrid, "natural-language query routed to hybrid semantic and symbol retrieval", searchOptions{
@@ -136,6 +153,7 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 			semantic:       true,
 			graphExpand:    true,
 			lexicalChunks:  true,
+			confidenceGate: true,
 		})
 	default:
 		return SearchResult{}, fmt.Errorf("unsupported query mode %q", mode)
@@ -261,12 +279,22 @@ type searchOptions struct {
 	semantic       bool
 	graphExpand    bool
 	lexicalChunks  bool
+	confidenceGate bool
 }
 
 func (r *Router) runSearch(ctx context.Context, rootPath string, query string, limit int, mode QueryMode, reason string, opts searchOptions) (SearchResult, error) {
 	signals, err := r.collectSignals(ctx, rootPath, query, limit, opts)
 	if err != nil {
 		return SearchResult{}, err
+	}
+	if shouldSuppressLowConfidence(query, signals, opts) {
+		return SearchResult{
+			Plan: Plan{
+				Mode:   string(mode),
+				Reason: reason + "; low-confidence semantic-only candidates were suppressed (use --mode semantic to override)",
+			},
+			Hits: nil,
+		}, nil
 	}
 	hits, err := r.rankSearchHits(ctx, rootPath, query, limit, signals, opts)
 	if err != nil {
@@ -313,6 +341,7 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 		}()
 	}
 	if opts.semantic && !isNoopEmbedder(r.embedder) {
+		semanticLimit := semanticCandidateLimit(limit)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -333,7 +362,7 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 			semanticWG.Add(1)
 			go func() {
 				defer semanticWG.Done()
-				signals.semanticChunks, semanticChunkErr = r.store.SemanticSearchChunks(ctx, rootPath, vectors[0].Values, limit)
+				signals.semanticChunks, semanticChunkErr = r.store.SemanticSearchChunks(ctx, rootPath, vectors[0].Values, semanticLimit)
 			}()
 			semanticWG.Wait()
 		}()
@@ -352,6 +381,7 @@ func (r *Router) collectSignals(ctx context.Context, rootPath string, query stri
 	if semanticChunkErr != nil {
 		return querySignals{}, semanticChunkErr
 	}
+	signals.semanticChunks = filterSemanticHits(signals.semanticChunks, semanticSimilarityAbsoluteFloor, semanticSimilarityRelativeFloor)
 	return signals, nil
 }
 
@@ -454,6 +484,10 @@ func (r *Router) rankSearchHits(ctx context.Context, rootPath string, query stri
 		}
 		return ranked[i].Score > ranked[j].Score
 	})
+	softmax := softmaxHitScores(ranked, scoreSoftmaxTemperature)
+	for i := range ranked {
+		ranked[i].SoftmaxProbability = softmax[i]
+	}
 	if len(ranked) > limit {
 		ranked = ranked[:limit]
 	}
@@ -582,6 +616,102 @@ func similarityFromDistance(distance float64) float64 {
 		return 1
 	}
 	return 1.0 / (1.0 + distance)
+}
+
+func semanticCandidateLimit(limit int) int {
+	base := max(1, limit) * semanticCandidateMultiplier
+	if base < semanticMinCandidatePool {
+		base = semanticMinCandidatePool
+	}
+	if base > semanticMaxCandidatePool {
+		base = semanticMaxCandidatePool
+	}
+	return base
+}
+
+func filterSemanticHits(hits []store.SearchHit, absoluteFloor float64, relativeFloor float64) []store.SearchHit {
+	if len(hits) == 0 {
+		return nil
+	}
+	bestSimilarity := similarityFromDistance(hits[0].Score)
+	threshold := maxFloat(absoluteFloor, bestSimilarity*relativeFloor)
+	filtered := make([]store.SearchHit, 0, len(hits))
+	for _, hit := range hits {
+		if similarityFromDistance(hit.Score) >= threshold {
+			filtered = append(filtered, hit)
+		}
+	}
+	if len(filtered) == 0 {
+		return hits[:1]
+	}
+	return filtered
+}
+
+func shouldSuppressLowConfidence(query string, signals querySignals, opts searchOptions) bool {
+	if !opts.confidenceGate {
+		return false
+	}
+	if signals.exactDef != nil || len(signals.lexicalSymbols) > 0 || len(signals.lexicalChunks) > 0 {
+		return false
+	}
+	if len(signals.semanticChunks) == 0 {
+		return true
+	}
+	terms := queryTerms(query)
+	topSimilarity := similarityFromDistance(signals.semanticChunks[0].Score)
+	if len(terms) < 2 {
+		return topSimilarity < semanticSingleTokenConfidenceFloor
+	}
+	return topSimilarity < semanticMultiTokenConfidenceFloor
+}
+
+func queryTerms(query string) []string {
+	fields := strings.Fields(strings.ToLower(strings.TrimSpace(query)))
+	terms := make([]string, 0, len(fields))
+	for _, field := range fields {
+		term := strings.Trim(field, " \t\r\n.,:;!?()[]{}<>\"'`")
+		if term == "" {
+			continue
+		}
+		terms = append(terms, term)
+	}
+	return terms
+}
+
+func softmaxHitScores(hits []store.SearchHit, temperature float64) []float64 {
+	if len(hits) == 0 {
+		return nil
+	}
+	if temperature <= 0 {
+		temperature = 1
+	}
+	maxScore := hits[0].Score
+	for _, hit := range hits[1:] {
+		if hit.Score > maxScore {
+			maxScore = hit.Score
+		}
+	}
+	weights := make([]float64, len(hits))
+	total := 0.0
+	for i, hit := range hits {
+		w := math.Exp((hit.Score - maxScore) / temperature)
+		if math.IsNaN(w) || math.IsInf(w, 0) {
+			w = 0
+		}
+		weights[i] = w
+		total += w
+	}
+	if total <= 0 {
+		uniform := 1.0 / float64(len(weights))
+		for i := range weights {
+			weights[i] = uniform
+		}
+		return weights
+	}
+	for i := range weights {
+		weights[i] /= total
+	}
+	return weights
 }
 
 func graphWeight(kind string, direction string) float64 {

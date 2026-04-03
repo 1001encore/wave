@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -191,4 +192,70 @@ func TestDefinitionExposesAllExactMatchesAcrossLanguages(t *testing.T) {
 	if len(result.Candidates) != 2 {
 		t.Fatalf("candidate count = %d, want 2", len(result.Candidates))
 	}
+}
+
+func TestFilterSemanticHitsAppliesRelativeFloor(t *testing.T) {
+	hits := []store.SearchHit{
+		{Score: distanceForSimilarity(0.50)},
+		{Score: distanceForSimilarity(0.42)},
+		{Score: distanceForSimilarity(0.34)},
+		{Score: distanceForSimilarity(0.10)},
+	}
+
+	filtered := filterSemanticHits(hits, 0.20, 0.70)
+	if len(filtered) != 2 {
+		t.Fatalf("filtered hit count = %d, want 2", len(filtered))
+	}
+}
+
+func TestShouldSuppressLowConfidenceSingleTokenSemanticOnly(t *testing.T) {
+	signals := querySignals{
+		semanticChunks: []store.SearchHit{
+			{Score: distanceForSimilarity(0.45)},
+		},
+	}
+	if !shouldSuppressLowConfidence("q9x2v7m4k8p1r6t3n0c5b2h7j4w8", signals, searchOptions{confidenceGate: true}) {
+		t.Fatal("expected low-confidence single token semantic-only query to be suppressed")
+	}
+}
+
+func TestShouldNotSuppressWithLexicalEvidence(t *testing.T) {
+	signals := querySignals{
+		semanticChunks: []store.SearchHit{
+			{Score: distanceForSimilarity(0.40)},
+		},
+		lexicalChunks: []store.SearchHit{
+			{ChunkID: 1},
+		},
+	}
+	if shouldSuppressLowConfidence("search rank fusion", signals, searchOptions{confidenceGate: true}) {
+		t.Fatal("expected lexical evidence to bypass confidence suppression")
+	}
+}
+
+func TestSoftmaxHitScoresNormalizes(t *testing.T) {
+	hits := []store.SearchHit{
+		{Score: 10},
+		{Score: 9},
+		{Score: 2},
+	}
+
+	probs := softmaxHitScores(hits, 4.0)
+	if len(probs) != 3 {
+		t.Fatalf("prob count = %d, want 3", len(probs))
+	}
+	total := probs[0] + probs[1] + probs[2]
+	if math.Abs(total-1.0) > 1e-9 {
+		t.Fatalf("prob total = %.10f, want 1.0", total)
+	}
+	if probs[0] <= probs[1] || probs[1] <= probs[2] {
+		t.Fatalf("expected descending probabilities, got %#v", probs)
+	}
+}
+
+func distanceForSimilarity(similarity float64) float64 {
+	if similarity <= 0 {
+		return 1e9
+	}
+	return (1.0 / similarity) - 1.0
 }

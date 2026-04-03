@@ -1,6 +1,7 @@
 package golang
 
 import (
+	"os"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -46,5 +47,42 @@ func TestNormalizeDisplayName(t *testing.T) {
 	got := Adapter{}.NormalizeDisplayName("scip-go gomod samplego 0.1.0 pkg/worker.go:Worker#Run().")
 	if got != "Run" {
 		t.Fatalf("normalize display name = %q, want %q", got, "Run")
+	}
+}
+
+func TestSourceFilesSkipsTestdataDirectory(t *testing.T) {
+	root := t.TempDir()
+	mustWriteFile(t, filepath.Join(root, "go.mod"), []byte("module example.com/test\n\ngo 1.23\n"))
+	mustWriteFile(t, filepath.Join(root, "main.go"), []byte("package main\n"))
+	mustWriteFile(t, filepath.Join(root, "pkg", "util.go"), []byte("package pkg\n"))
+	mustWriteFile(t, filepath.Join(root, "testdata", "fixture.go"), []byte("package testdata\n"))
+
+	adapter := Adapter{}
+	unit, err := adapter.Detect(root)
+	if err != nil {
+		t.Fatalf("detect go unit: %v", err)
+	}
+
+	files, err := adapter.SourceFiles(unit)
+	if err != nil {
+		t.Fatalf("list source files: %v", err)
+	}
+
+	want := []string{
+		"main.go",
+		"pkg/util.go",
+	}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("source files = %#v, want %#v", files, want)
+	}
+}
+
+func mustWriteFile(t *testing.T, path string, content []byte) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatalf("write %s: %v", path, err)
 	}
 }

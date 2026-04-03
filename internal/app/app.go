@@ -311,16 +311,16 @@ func runSearch(ctx context.Context, args []string) int {
 		return 0
 	}
 
+	if cc.explain {
+		fmt.Printf("Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
+	}
 	if len(result.Hits) == 0 {
 		fmt.Println("No matches.")
 		return 0
 	}
 	var softmax []float64
 	if showSoftmax {
-		softmax = softmaxProbabilities(result.Hits)
-	}
-	if cc.explain {
-		fmt.Printf("Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
+		softmax = outputSoftmaxProbabilities(result.Hits)
 	}
 	fmt.Printf("Matches: %d\n", len(result.Hits))
 	for i, hit := range result.Hits {
@@ -331,7 +331,7 @@ func runSearch(ctx context.Context, args []string) int {
 				parts = append(parts, fmt.Sprintf("score=%.3f", hit.Score))
 			}
 			if showSoftmax {
-				parts = append(parts, fmt.Sprintf("softmax=%.4f", softmax[i]))
+				parts = append(parts, fmt.Sprintf("softmax=%.1f%%", softmax[i]*100))
 			}
 			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
 		}
@@ -1161,6 +1161,7 @@ func buildPayload(
 	indexResult indexer.Result,
 	embedder embed.Provider,
 ) (store.IndexPayload, error) {
+	rootPath := filepath.Clean(unit.RootPath)
 	fileMap := map[string]store.FileData{}
 	fileSources := map[string][]byte{}
 	symbolMap := map[string]store.SymbolData{}
@@ -1175,8 +1176,10 @@ func buildPayload(
 	}
 
 	for _, doc := range index.GetDocuments() {
-		relativePath := filepath.Clean(doc.GetRelativePath())
-		absPath := filepath.Join(unit.RootPath, relativePath)
+		relativePath, absPath, ok := resolveDocumentPath(rootPath, doc.GetRelativePath())
+		if !ok {
+			continue
+		}
 		content, err := os.ReadFile(absPath)
 		if err != nil {
 			return store.IndexPayload{}, fmt.Errorf("read source file %s: %w", absPath, err)
@@ -1366,6 +1369,43 @@ func buildPayload(
 		Edges:        dedupeEdges(edges),
 		Embeddings:   embeddings,
 	}, nil
+}
+
+func resolveDocumentPath(rootPath string, rawRelativePath string) (string, string, bool) {
+	relativePath := normalizeRelativePath(rawRelativePath)
+	if relativePath == "" {
+		return "", "", false
+	}
+
+	absPath := filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(relativePath)))
+	if !pathWithinRoot(rootPath, absPath) {
+		return "", "", false
+	}
+	return relativePath, absPath, true
+}
+
+func normalizeRelativePath(path string) string {
+	path = strings.TrimSpace(path)
+	path = strings.ReplaceAll(path, "\\", "/")
+	path = filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	path = strings.TrimPrefix(path, "./")
+	if path == "." {
+		return ""
+	}
+	return path
+}
+
+func pathWithinRoot(rootPath string, candidatePath string) bool {
+	root := filepath.Clean(rootPath)
+	candidate := filepath.Clean(candidatePath)
+	rel, err := filepath.Rel(root, candidate)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
@@ -1922,7 +1962,7 @@ func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax 
 	out := make([]searchHitOutput, 0, len(hits))
 	var softmax []float64
 	if includeSoftmax {
-		softmax = softmaxProbabilities(hits)
+		softmax = outputSoftmaxProbabilities(hits)
 	}
 	for i, hit := range hits {
 		item := searchHitOutput{
@@ -1982,6 +2022,27 @@ func softmaxProbabilities(hits []store.SearchHit) []float64 {
 		weights[i] /= total
 	}
 	return weights
+}
+
+func outputSoftmaxProbabilities(hits []store.SearchHit) []float64 {
+	if len(hits) == 0 {
+		return nil
+	}
+	usePrecomputed := true
+	for _, hit := range hits {
+		if hit.SoftmaxProbability <= 0 {
+			usePrecomputed = false
+			break
+		}
+	}
+	if usePrecomputed {
+		probs := make([]float64, len(hits))
+		for i, hit := range hits {
+			probs[i] = hit.SoftmaxProbability
+		}
+		return probs
+	}
+	return softmaxProbabilities(hits)
 }
 
 func adapterByID(id string) indexer.Adapter {

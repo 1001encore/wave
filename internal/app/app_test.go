@@ -138,6 +138,32 @@ func TestDetectWorkspaceUnitsPrefersMoreSpecificRootOnTie(t *testing.T) {
 	}
 }
 
+func TestResolveDocumentPathRejectsPathsOutsideRoot(t *testing.T) {
+	root := t.TempDir()
+	normalizedRoot, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("resolve root path: %v", err)
+	}
+
+	rel, abs, ok := resolveDocumentPath(normalizedRoot, "internal\\query\\router.go")
+	if !ok {
+		t.Fatal("expected in-root path to resolve")
+	}
+	if rel != "internal/query/router.go" {
+		t.Fatalf("relative path = %q, want %q", rel, "internal/query/router.go")
+	}
+	if abs != filepath.Join(normalizedRoot, "internal", "query", "router.go") {
+		t.Fatalf("abs path = %q, want %q", abs, filepath.Join(normalizedRoot, "internal", "query", "router.go"))
+	}
+
+	if _, _, ok := resolveDocumentPath(normalizedRoot, filepath.Join("..", ".cache", "go-build", "x.go")); ok {
+		t.Fatal("expected escaped path to be rejected")
+	}
+	if _, _, ok := resolveDocumentPath(normalizedRoot, ""); ok {
+		t.Fatal("expected empty path to be rejected")
+	}
+}
+
 func TestBindCommonFlagsDefaultsDeviceToCUDA(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	cc := bindCommonFlags(fs)
@@ -367,5 +393,23 @@ func TestSoftmaxProbabilitiesNormalizeAndStayRelative(t *testing.T) {
 	}
 	if got[0] < 0.80 || got[0] > 0.90 {
 		t.Fatalf("first probability = %.6f, expected near 0.83 for 3/1/0.2 inputs", got[0])
+	}
+}
+
+func TestSearchHitsOutputUsesPrecomputedSoftmaxWhenPresent(t *testing.T) {
+	hits := []store.SearchHit{
+		{ChunkID: 1, Score: 100, SoftmaxProbability: 0.7},
+		{ChunkID: 2, Score: 90, SoftmaxProbability: 0.3},
+	}
+
+	out := searchHitsOutput(hits, true, true)
+	if len(out) != 2 {
+		t.Fatalf("hit count = %d, want 2", len(out))
+	}
+	if out[0].SoftmaxProbability == nil || out[1].SoftmaxProbability == nil {
+		t.Fatal("softmax probabilities should be populated")
+	}
+	if *out[0].SoftmaxProbability != 0.7 || *out[1].SoftmaxProbability != 0.3 {
+		t.Fatalf("softmax probabilities = %.3f %.3f, want 0.700 0.300", *out[0].SoftmaxProbability, *out[1].SoftmaxProbability)
 	}
 }

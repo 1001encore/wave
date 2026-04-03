@@ -171,17 +171,18 @@ type ChunkSymbolLink struct {
 }
 
 type SearchHit struct {
-	ChunkID         int64   `json:"chunk_id"`
-	FileID          int64   `json:"file_id"`
-	PrimarySymbolID int64   `json:"primary_symbol_id"`
-	Path            string  `json:"path"`
-	StartLine       int     `json:"start_line"`
-	EndLine         int     `json:"end_line"`
-	Kind            string  `json:"kind"`
-	Name            string  `json:"name"`
-	HeaderText      string  `json:"header_text"`
-	Text            string  `json:"text"`
-	Score           float64 `json:"score"`
+	ChunkID            int64   `json:"chunk_id"`
+	FileID             int64   `json:"file_id"`
+	PrimarySymbolID    int64   `json:"primary_symbol_id"`
+	Path               string  `json:"path"`
+	StartLine          int     `json:"start_line"`
+	EndLine            int     `json:"end_line"`
+	Kind               string  `json:"kind"`
+	Name               string  `json:"name"`
+	HeaderText         string  `json:"header_text"`
+	Text               string  `json:"text"`
+	Score              float64 `json:"score"`
+	SoftmaxProbability float64 `json:"softmax_probability,omitempty"`
 }
 
 type SymbolSearchHit struct {

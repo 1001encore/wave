@@ -112,7 +112,7 @@ func (Adapter) SourceFiles(unit workspace.Unit) ([]string, error) {
 		}
 		if d.IsDir() {
 			switch d.Name() {
-			case ".git", ".wave", "vendor", "bin":
+			case ".git", ".wave", "vendor", "bin", "testdata":
 				if path != unit.RootPath {
 					return filepath.SkipDir
 				}
