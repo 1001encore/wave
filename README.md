@@ -71,7 +71,7 @@ wave refs processData
 - `--mode auto|hybrid|symbol|semantic|graph` (for `search` and `context`)
 - `--limit <n>`
 - `--explain`
-- `--device cpu|cuda` (default: `cuda`)
+- `--device cpu|cuda` (default: `cpu` for query/status commands, `cuda` for `index`)
 - `wave search --show-score` — include raw rerank score per hit
 - `wave search --show-softmax` — include softmax probability per hit (relative within returned hits)
 
@@ -90,7 +90,7 @@ If a required installer toolchain is missing (for example `go`, `rustup`, or `co
 
 - Index data is stored at `.wave/wave.db`.
 - Large refactors can trigger automatic re-index before query commands.
-- GPU (`--device cuda`, auto-detected by ONNX) is the default path for both indexing and querying; CPU works as a fallback.
+- Indexing defaults to GPU (`--device cuda`) when available; query/status commands default to CPU for lower interactive overhead. You can override either per command with `--device`.
 
 ## License
 

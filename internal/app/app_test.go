@@ -164,9 +164,23 @@ func TestResolveDocumentPathRejectsPathsOutsideRoot(t *testing.T) {
 	}
 }
 
-func TestBindCommonFlagsDefaultsDeviceToCUDA(t *testing.T) {
+func TestBindCommonFlagsDefaultsDeviceToCPU(t *testing.T) {
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	cc := bindCommonFlags(fs)
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse flags: %v", err)
+	}
+	if cc.device != "cpu" {
+		t.Fatalf("device default = %q, want %q", cc.device, "cpu")
+	}
+	if cc.limit != defaultResultLimit {
+		t.Fatalf("limit default = %d, want %d", cc.limit, defaultResultLimit)
+	}
+}
+
+func TestBindIndexFlagsDefaultsDeviceToCUDA(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	cc := bindIndexFlags(fs)
 	if err := fs.Parse(nil); err != nil {
 		t.Fatalf("parse flags: %v", err)
 	}
@@ -186,6 +200,9 @@ func TestBindCommonFlagsWithLimitOverridesDefault(t *testing.T) {
 	}
 	if cc.limit != 3 {
 		t.Fatalf("limit default = %d, want %d", cc.limit, 3)
+	}
+	if cc.device != "cpu" {
+		t.Fatalf("device default = %q, want %q", cc.device, "cpu")
 	}
 }
 

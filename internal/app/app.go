@@ -133,7 +133,7 @@ func Run(ctx context.Context, args []string) int {
 
 func runIndex(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("index", flag.ContinueOnError)
-	cc := bindCommonFlags(fs)
+	cc := bindIndexFlags(fs)
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -603,10 +603,18 @@ func runContext(ctx context.Context, args []string) int {
 }
 
 func bindCommonFlags(fs *flag.FlagSet) *commandContext {
-	return bindCommonFlagsWithLimit(fs, defaultResultLimit)
+	return bindCommonFlagsWithLimitAndDevice(fs, defaultResultLimit, "cpu")
+}
+
+func bindIndexFlags(fs *flag.FlagSet) *commandContext {
+	return bindCommonFlagsWithLimitAndDevice(fs, defaultResultLimit, "cuda")
 }
 
 func bindCommonFlagsWithLimit(fs *flag.FlagSet, defaultLimit int) *commandContext {
+	return bindCommonFlagsWithLimitAndDevice(fs, defaultLimit, "cpu")
+}
+
+func bindCommonFlagsWithLimitAndDevice(fs *flag.FlagSet, defaultLimit int, defaultDevice string) *commandContext {
 	cc := &commandContext{}
 	cwd, _ := os.Getwd()
 	fs.StringVar(&cc.rootPath, "root", cwd, "project root or a path inside the project")
@@ -615,7 +623,7 @@ func bindCommonFlagsWithLimit(fs *flag.FlagSet, defaultLimit int) *commandContex
 	fs.IntVar(&cc.limit, "limit", defaultLimit, "result limit")
 	fs.BoolVar(&cc.explain, "explain", false, "include routing and freshness details")
 	fs.StringVar(&cc.mode, "mode", "auto", "query mode: auto, hybrid, symbol, semantic, graph")
-	fs.StringVar(&cc.device, "device", "cuda", "embedding device: cpu, cuda (default: cuda)")
+	fs.StringVar(&cc.device, "device", defaultDevice, "embedding device: cpu, cuda")
 	return cc
 }
 
