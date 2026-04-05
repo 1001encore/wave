@@ -83,7 +83,7 @@ If a required installer toolchain is missing (for example `go`, `rustup`, or `co
 
 - Python 3 is required for embedding-backed workflows (`index`, `search`, `context`, and auto-reindex triggered before query commands).
 - Embeddings use ONNX with `all-MiniLM-L6-v2-code-search-512` (size of ~90MB, downloaded first time only).
-- `wave` uses a Wave-managed runtime (`~/.cache/wave/runtime`) for embedding dependencies when the project runtime is missing them.
+- `wave` uses a Wave-managed runtime (`~/.cache/wave/runtime`) by default for embedding dependencies (independent of project virtual environments).
 - Package installation inside that Wave-managed runtime uses `uv` (`uv pip`).
 
 ## Notes

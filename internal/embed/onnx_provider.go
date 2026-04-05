@@ -433,25 +433,22 @@ func resolvePythonPath(searchRoots []string, device string) (string, error) {
 		return filepath.Clean(override), nil
 	}
 
+	basePython, err := resolveBasePython(searchRoots)
+	if err != nil {
+		return "", err
+	}
+	return ensureEmbeddedRuntime(basePython, device)
+}
+
+func resolveBasePython(searchRoots []string) (string, error) {
 	if path := firstExistingFile(rootedPath(searchRoots, ".venv", "bin", "python")...); path != "" {
-		if err := ensurePythonDeps(path); err == nil {
-			return path, nil
-		}
-		fmt.Fprintf(os.Stderr, "info: project python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
+		return path, nil
 	}
 	if path, err := exec.LookPath("python3"); err == nil {
-		if err := ensurePythonDeps(path); err == nil {
-			return path, nil
-		}
-		fmt.Fprintf(os.Stderr, "info: python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
-		return ensureEmbeddedRuntime(path, device)
+		return path, nil
 	}
 	if path, err := exec.LookPath("python"); err == nil {
-		if err := ensurePythonDeps(path); err == nil {
-			return path, nil
-		}
-		fmt.Fprintf(os.Stderr, "info: python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
-		return ensureEmbeddedRuntime(path, device)
+		return path, nil
 	}
 	return "", fmt.Errorf("python runtime not found; expected project .venv/bin/python or python3 on PATH")
 }

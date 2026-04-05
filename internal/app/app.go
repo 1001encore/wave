@@ -325,7 +325,12 @@ func runSearch(ctx context.Context, args []string) int {
 	}
 	fmt.Printf("Matches: %d\n", len(result.Hits))
 	for i, hit := range result.Hits {
+		displayPath := formatSearchDisplayPath(rootPath, hit.Path)
+		kind := prettifySearchKind(hit.Kind)
 		summary := firstNonEmpty(hit.Name, hit.HeaderText)
+		if summary == "" {
+			summary = "(anonymous)"
+		}
 		if showScore || showSoftmax {
 			parts := make([]string, 0, 2)
 			if showScore {
@@ -337,15 +342,15 @@ func runSearch(ctx context.Context, args []string) int {
 			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
 		}
 		fmt.Printf(
-			"%d. %s:%d-%d  [%s]  %s\n",
+			"%d. %s:%d-%d  %s: %s\n",
 			i+1,
-			hit.Path,
+			displayPath,
 			hit.StartLine+1,
 			hit.EndLine+1,
-			hit.Kind,
+			kind,
 			summary,
 		)
-		snippet := truncate(hit.HeaderText, 200)
+		snippet := searchCodePreview(hit.HeaderText, 200)
 		if snippet != "" {
 			fmt.Printf("   code: %s\n", snippet)
 		}
@@ -1880,6 +1885,53 @@ func truncate(value string, n int) string {
 		return value
 	}
 	return value[:n] + "..."
+}
+
+func formatSearchDisplayPath(rootPath string, hitPath string) string {
+	cleanRoot := filepath.Clean(rootPath)
+	cleanHit := filepath.Clean(hitPath)
+	if filepath.IsAbs(cleanHit) && pathWithinRoot(cleanRoot, cleanHit) {
+		if rel, err := filepath.Rel(cleanRoot, cleanHit); err == nil {
+			return "./" + filepath.ToSlash(rel)
+		}
+	}
+	slashPath := filepath.ToSlash(hitPath)
+	if strings.HasPrefix(slashPath, "./") || strings.HasPrefix(slashPath, "../") {
+		return slashPath
+	}
+	if filepath.IsAbs(hitPath) {
+		return slashPath
+	}
+	return "./" + slashPath
+}
+
+func prettifySearchKind(kind string) string {
+	kind = strings.TrimSpace(strings.ReplaceAll(kind, "_", " "))
+	if kind == "" {
+		return "Result"
+	}
+	words := strings.Fields(kind)
+	for i, word := range words {
+		if len(word) == 0 {
+			continue
+		}
+		words[i] = strings.ToUpper(word[:1]) + word[1:]
+	}
+	return strings.Join(words, " ")
+}
+
+func searchCodePreview(headerText string, maxChars int) string {
+	line := strings.TrimSpace(headerText)
+	if idx := strings.IndexByte(line, '\n'); idx >= 0 {
+		line = strings.TrimSpace(line[:idx])
+	}
+	if line == "" {
+		return ""
+	}
+	if len(line) > maxChars {
+		line = line[:maxChars]
+	}
+	return line + "..."
 }
 
 func min(a, b int) int {
