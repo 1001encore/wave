@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/1001encore/wave/internal/indexer"
 	queryrouter "github.com/1001encore/wave/internal/query"
 	"github.com/1001encore/wave/internal/store"
 )
@@ -227,6 +228,59 @@ func TestModeNeedsSemanticEmbedding(t *testing.T) {
 	}
 }
 
+func TestShouldAutoReindexThresholds(t *testing.T) {
+	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedFiles: 24, ChangedRatio: 0.18}); ok {
+		t.Fatal("expected previous threshold (24 files, 18%) to no longer auto re-index")
+	}
+	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedFiles: 30, ChangedRatio: 0.22}); !ok {
+		t.Fatal("expected updated threshold (30 files, 22%) to auto re-index")
+	}
+	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, MissingFiles: 10}); !ok {
+		t.Fatal("expected missing-file floor to auto re-index")
+	}
+}
+
+func TestShouldShowFreshnessWarningThresholds(t *testing.T) {
+	if shouldShowFreshnessWarning(indexer.Freshness{
+		Dirty:        true,
+		DirtyFiles:   1,
+		ChangedFiles: 1,
+		ChangedRatio: 0.02,
+	}) {
+		t.Fatal("expected tiny staleness to suppress warning")
+	}
+	if shouldShowFreshnessWarning(indexer.Freshness{
+		Dirty:        true,
+		DirtyFiles:   19,
+		ChangedFiles: 19,
+		ChangedRatio: 0.20,
+	}) {
+		t.Fatal("expected warning to stay suppressed below the 2/3 changed-files threshold")
+	}
+	if !shouldShowFreshnessWarning(indexer.Freshness{
+		Dirty:        true,
+		DirtyFiles:   20,
+		ChangedFiles: 20,
+		ChangedRatio: 0.15,
+	}) {
+		t.Fatal("expected moderate staleness to show warning")
+	}
+	if shouldShowFreshnessWarning(indexer.Freshness{
+		Dirty:        true,
+		MissingFiles: 6,
+		ChangedFiles: 6,
+	}) {
+		t.Fatal("expected warning to stay suppressed below the 2/3 missing-files threshold")
+	}
+	if !shouldShowFreshnessWarning(indexer.Freshness{
+		Dirty:        true,
+		MissingFiles: 7,
+		ChangedFiles: 7,
+	}) {
+		t.Fatal("expected missing-file threshold to show warning")
+	}
+}
+
 func TestIndexerInstallSpecForAdapter(t *testing.T) {
 	tests := []struct {
 		adapterID  string
@@ -284,11 +338,14 @@ func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, "greet", result, true, 3)
+	writeDefinitionOutput(&buf, "/tmp", "greet", result, true, 3)
 	out := buf.String()
 
 	if !strings.Contains(out, "Definition: greet [function]") {
 		t.Fatalf("output missing primary definition:\n%s", out)
+	}
+	if !strings.Contains(out, "Location: ./a.py:1:1") {
+		t.Fatalf("output missing relative primary location:\n%s", out)
 	}
 	if !strings.Contains(out, "---") {
 		t.Fatalf("output missing divider:\n%s", out)
@@ -296,7 +353,7 @@ func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
 	if !strings.Contains(out, "Other matches for \"greet\":") {
 		t.Fatalf("output missing alternate heading:\n%s", out)
 	}
-	if !strings.Contains(out, "/tmp/b.ts:11:4") || !strings.Contains(out, "/tmp/c.rb:21:6") || !strings.Contains(out, "/tmp/d.go:31:8") {
+	if !strings.Contains(out, "./b.ts:11:4") || !strings.Contains(out, "./c.rb:21:6") || !strings.Contains(out, "./d.go:31:8") {
 		t.Fatalf("output missing alternates:\n%s", out)
 	}
 }
@@ -319,17 +376,26 @@ func TestWriteDefinitionOutputRespectsAlternateLimit(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, "greet", result, false, 2)
+	writeDefinitionOutput(&buf, "/tmp", "greet", result, false, 2)
 	out := buf.String()
 
-	if !strings.Contains(out, "/tmp/b.ts:11:4") || !strings.Contains(out, "/tmp/c.rb:21:6") {
+	if !strings.Contains(out, "./b.ts:11:4") || !strings.Contains(out, "./c.rb:21:6") {
 		t.Fatalf("output missing expected alternates:\n%s", out)
 	}
-	if strings.Contains(out, "/tmp/d.go:31:8") {
+	if strings.Contains(out, "./d.go:31:8") {
 		t.Fatalf("output should be limited to first 2 alternates:\n%s", out)
 	}
 	if !strings.Contains(out, "... and 1 more") {
 		t.Fatalf("output missing overflow count:\n%s", out)
+	}
+}
+
+func TestFormatDocSummaryStripsFencesAndFlattens(t *testing.T) {
+	in := "```go\nfunc (*SymbolInformation).GetRelationships() []*Relationship\n```"
+	got := formatDocSummary(in)
+	want := "func (*SymbolInformation).GetRelationships() []*Relationship"
+	if got != want {
+		t.Fatalf("formatDocSummary() = %q, want %q", got, want)
 	}
 }
 

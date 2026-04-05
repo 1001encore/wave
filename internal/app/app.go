@@ -85,9 +85,12 @@ type indexerInstallSpec struct {
 }
 
 const (
-	autoReindexMinChangedFiles  = 24
-	autoReindexMinChangedRatio  = 0.18
-	autoReindexMissingFileFloor = 8
+	autoReindexMinChangedFiles  = 30
+	autoReindexMinChangedRatio  = 0.22
+	autoReindexMissingFileFloor = 10
+	warnMinChangedFiles         = (autoReindexMinChangedFiles * 2) / 3
+	warnMinChangedRatio         = autoReindexMinChangedRatio * (2.0 / 3.0)
+	warnMissingFileFloor        = (autoReindexMissingFileFloor*2 + 2) / 3
 	defaultResultLimit          = 10
 	defaultDefLimit             = 3
 	defaultRefsLimit            = 3
@@ -356,11 +359,11 @@ func runSearch(ctx context.Context, args []string) int {
 	if clippedMatches {
 		fmt.Printf("Top Matches: %d, use --limit to show more\n", len(result.Hits))
 	} else {
-		fmt.Printf("Matches: %d\n", len(result.Hits))
+		fmt.Printf("Top Matches: %d\n", len(result.Hits))
 	}
 	for i, hit := range result.Hits {
 		displayPath := formatSearchDisplayPath(rootPath, hit.Path)
-		kind := prettifySearchKind(hit.Kind)
+		kind := strings.ToLower(prettifySearchKind(hit.Kind))
 		summary := firstNonEmpty(hit.Name, hit.HeaderText)
 		if summary == "" {
 			summary = "(anonymous)"
@@ -376,17 +379,17 @@ func runSearch(ctx context.Context, args []string) int {
 			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
 		}
 		fmt.Printf(
-			"%d. %s:%d-%d  %s: %s\n",
+			"%d. %s (%s) at %s:%d-%d\n",
 			i+1,
+			summary,
+			kind,
 			displayPath,
 			hit.StartLine+1,
 			hit.EndLine+1,
-			kind,
-			summary,
 		)
 		snippet := searchCodePreview(hit.HeaderText, 200)
 		if snippet != "" {
-			fmt.Printf("   code: %s\n", snippet)
+			fmt.Printf("   Code: %s\n", snippet)
 		}
 	}
 	return 0
@@ -451,7 +454,7 @@ func runDef(ctx context.Context, args []string) int {
 		printJSON(definitionJSONPayload(result, cc.explain))
 		return 0
 	}
-	writeDefinitionOutput(os.Stdout, symbol, result, cc.explain, cc.limit)
+	writeDefinitionOutput(os.Stdout, rootPath, symbol, result, cc.explain, cc.limit)
 	return 0
 }
 
@@ -1331,6 +1334,22 @@ func shouldAutoReindex(freshness indexer.Freshness) (bool, string) {
 		return true, fmt.Sprintf("index is stale with many moved/deleted files (>= %d missing)", autoReindexMissingFileFloor)
 	}
 	return false, ""
+}
+
+func shouldShowFreshnessWarning(freshness indexer.Freshness) bool {
+	if !freshness.Dirty {
+		return false
+	}
+	if ok, _ := shouldAutoReindex(freshness); ok {
+		return true
+	}
+	if freshness.ChangedFiles >= warnMinChangedFiles && freshness.ChangedRatio >= warnMinChangedRatio {
+		return true
+	}
+	if freshness.MissingFiles >= warnMissingFileFloor {
+		return true
+	}
+	return false
 }
 
 func buildPayload(
@@ -2358,7 +2377,7 @@ func printFreshnessWarning(ctx context.Context, st *store.Store, units []indexer
 	}
 	for _, item := range units {
 		freshness, err := indexer.ComputeFreshness(ctx, st, item.Adapter, item.Unit)
-		if err != nil || !freshness.Dirty {
+		if err != nil || !shouldShowFreshnessWarning(freshness) {
 			continue
 		}
 		fmt.Fprintf(
@@ -2380,11 +2399,11 @@ func definitionJSONPayload(result queryrouter.DefinitionResult, explain bool) an
 	return result.Definition
 }
 
-func writeDefinitionOutput(w io.Writer, symbol string, result queryrouter.DefinitionResult, explain bool, alternateLimit int) {
+func writeDefinitionOutput(w io.Writer, rootPath string, symbol string, result queryrouter.DefinitionResult, explain bool, alternateLimit int) {
 	if explain {
 		fmt.Fprintf(w, "Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
 	}
-	printDefinitionEntry(w, "Definition", result.Definition)
+	printDefinitionEntry(w, rootPath, "Definition", result.Definition)
 
 	if len(result.Candidates) == 0 {
 		return
@@ -2410,12 +2429,13 @@ func writeDefinitionOutput(w io.Writer, symbol string, result queryrouter.Defini
 		limit = min(limit, alternateLimit)
 	}
 	for _, candidate := range alternates[:limit] {
+		displayPath := formatSearchDisplayPath(rootPath, candidate.Path)
 		fmt.Fprintf(
 			tw,
 			"%s\t%s\t%s:%d:%d\n",
 			candidate.DisplayName,
 			firstNonEmpty(candidate.Kind, "symbol"),
-			candidate.Path,
+			displayPath,
 			candidate.StartLine+1,
 			candidate.StartCol+1,
 		)
@@ -2426,13 +2446,31 @@ func writeDefinitionOutput(w io.Writer, symbol string, result queryrouter.Defini
 	}
 }
 
-func printDefinitionEntry(w io.Writer, label string, def *store.DefinitionResult) {
+func printDefinitionEntry(w io.Writer, rootPath string, label string, def *store.DefinitionResult) {
 	if def == nil {
 		return
 	}
+	displayPath := formatSearchDisplayPath(rootPath, def.Path)
 	fmt.Fprintf(w, "%s: %s [%s]\n", label, def.DisplayName, def.Kind)
-	fmt.Fprintf(w, "Location: %s:%d:%d\n", def.Path, def.StartLine+1, def.StartCol+1)
-	if def.DocSummary != "" {
-		fmt.Fprintf(w, "Doc: %s\n", def.DocSummary)
+	fmt.Fprintf(w, "Location: %s:%d:%d\n", displayPath, def.StartLine+1, def.StartCol+1)
+	if doc := formatDocSummary(def.DocSummary); doc != "" {
+		fmt.Fprintf(w, "Doc: %s\n", doc)
 	}
+}
+
+func formatDocSummary(summary string) string {
+	s := strings.TrimSpace(summary)
+	if s == "" {
+		return ""
+	}
+
+	lines := strings.Split(s, "\n")
+	if len(lines) >= 2 && strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
+		lines = lines[1:]
+		if n := len(lines); n > 0 && strings.TrimSpace(lines[n-1]) == "```" {
+			lines = lines[:n-1]
+		}
+		s = strings.TrimSpace(strings.Join(lines, "\n"))
+	}
+	return strings.Join(strings.Fields(s), " ")
 }
