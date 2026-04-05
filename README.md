@@ -42,6 +42,8 @@ Use GitHub Releases for manual binaries and archives:
 - `wave context <query>` — compact context bundle (seed + neighbors + graph + refs).
 - `wave def <symbol>` — exact symbol definition lookup.
 - `wave refs <symbol>` — symbol usage map for the resolved symbol.
+- `wave update` — self-update from GitHub Releases.
+- `wave version` — print the current CLI version.
 
 `--mode` is used with `wave search` and `wave context`:
 
@@ -62,6 +64,7 @@ wave context --mode semantic "retry with exponential backoff"
 wave search --mode graph "PaymentService"
 wave def MyClass
 wave refs processData
+wave update --check
 ```
 
 ## Common Flags
@@ -91,6 +94,7 @@ If a required installer toolchain is missing (for example `go`, `rustup`, or `co
 - Index data is stored at `.wave/wave.db`.
 - Large refactors can trigger automatic re-index before query commands.
 - Indexing defaults to GPU (`--device cuda`) when available; query/status commands default to CPU for lower interactive overhead. You can override either per command with `--device`.
+- Update checks are run at most once a day on the first command use, resulting on a single line update notice printed once at the next command use. You can set `WAVE_UPDATE_REMINDER=never` to disable update notices.
 
 ## License
 

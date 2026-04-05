@@ -34,6 +34,8 @@ import (
 	"github.com/1001encore/wave/internal/typescript"
 	"github.com/1001encore/wave/internal/vcs"
 	"github.com/1001encore/wave/internal/workspace"
+	"github.com/Masterminds/semver/v3"
+	"github.com/creativeprojects/go-selfupdate"
 )
 
 type commandContext struct {
@@ -89,7 +91,12 @@ const (
 	defaultResultLimit          = 10
 	defaultDefLimit             = 3
 	defaultRefsLimit            = 3
+	releaseRepoOwner            = "1001encore"
+	releaseRepoName             = "wave"
+	defaultVersion              = "dev"
 )
+
+var version = defaultVersion
 
 func adapters() []indexer.Adapter {
 	return []indexer.Adapter{
@@ -108,6 +115,7 @@ func Run(ctx context.Context, args []string) int {
 	}
 
 	cmd := args[0]
+	maybeRemindUpdate(ctx, cmd)
 	switch cmd {
 	case "index":
 		return runIndex(ctx, args[1:])
@@ -121,6 +129,12 @@ func Run(ctx context.Context, args []string) int {
 		return runRefs(ctx, args[1:])
 	case "context":
 		return runContext(ctx, args[1:])
+	case "update":
+		return runUpdate(ctx, args[1:])
+	case "version":
+		return runVersion(args[1:])
+	case "-v", "--version":
+		return runVersion(nil)
 	case "help", "-h", "--help":
 		printUsage()
 		return 0
@@ -606,6 +620,135 @@ func runContext(ctx context.Context, args []string) int {
 		_ = tw.Flush()
 	}
 	return 0
+}
+
+func runUpdate(ctx context.Context, args []string) int {
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	var checkOnly bool
+	var allowPrerelease bool
+	var jsonOut bool
+	fs.BoolVar(&checkOnly, "check", false, "only check whether an update is available")
+	fs.BoolVar(&allowPrerelease, "prerelease", false, "include prerelease versions")
+	fs.BoolVar(&jsonOut, "json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+
+	current, err := versionForUpdate()
+	if err != nil {
+		return fail(err)
+	}
+
+	updater, latest, found, err := detectLatestRelease(ctx, allowPrerelease)
+	if err != nil {
+		return fail(err)
+	}
+	if !found {
+		return fail(fmt.Errorf("no release found for %s/%s on %s/%s", releaseRepoOwner, releaseRepoName, runtime.GOOS, runtime.GOARCH))
+	}
+
+	upToDate := latest.LessOrEqual(current)
+	if checkOnly || upToDate {
+		if jsonOut {
+			printJSON(map[string]any{
+				"current_version":  current,
+				"latest_version":   latest.Version(),
+				"up_to_date":       upToDate,
+				"update_available": !upToDate,
+				"release_url":      latest.URL,
+			})
+			return 0
+		}
+		if upToDate {
+			fmt.Printf("wave is up to date (%s)\n", current)
+			return 0
+		}
+		fmt.Printf("update available: %s -> %s\n", current, latest.Version())
+		fmt.Printf("release: %s\n", latest.URL)
+		return 0
+	}
+
+	executablePath, err := selfupdate.ExecutablePath()
+	if err != nil {
+		return fail(fmt.Errorf("resolve executable path: %w", err))
+	}
+	if err := updater.UpdateTo(ctx, latest, executablePath); err != nil {
+		return fail(fmt.Errorf("update binary: %w", err))
+	}
+
+	if jsonOut {
+		printJSON(map[string]any{
+			"updated":          true,
+			"previous_version": current,
+			"current_version":  latest.Version(),
+			"release_url":      latest.URL,
+		})
+		return 0
+	}
+	fmt.Printf("updated wave from %s to %s\n", current, latest.Version())
+	fmt.Println("restart wave to use the new version")
+	return 0
+}
+
+func runVersion(args []string) int {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	var jsonOut bool
+	fs.BoolVar(&jsonOut, "json", false, "emit JSON")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
+
+	current := currentVersion()
+	if jsonOut {
+		printJSON(map[string]any{
+			"version": current,
+		})
+		return 0
+	}
+	fmt.Println(current)
+	return 0
+}
+
+func detectLatestRelease(ctx context.Context, allowPrerelease bool) (*selfupdate.Updater, *selfupdate.Release, bool, error) {
+	updater, err := selfupdate.NewUpdater(selfupdate.Config{
+		Prerelease: allowPrerelease,
+	})
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("create updater: %w", err)
+	}
+	repository := selfupdate.NewRepositorySlug(releaseRepoOwner, releaseRepoName)
+	latest, found, err := updater.DetectLatest(ctx, repository)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("detect latest release: %w", err)
+	}
+	return updater, latest, found, nil
+}
+
+func currentVersion() string {
+	v := strings.TrimSpace(version)
+	if v == "" {
+		return defaultVersion
+	}
+	return v
+}
+
+func versionForUpdate() (string, error) {
+	v := currentVersion()
+	if strings.EqualFold(v, defaultVersion) {
+		return "", fmt.Errorf(
+			"cannot self-update build version %q; install a tagged release or set %s at build time",
+			v,
+			"github.com/1001encore/wave/internal/app.version=vX.Y.Z",
+		)
+	}
+	if _, err := semver.NewVersion(v); err != nil {
+		return "", fmt.Errorf(
+			"cannot self-update non-semver build version %q: %w; expected something like v1.2.3",
+			v,
+			err,
+		)
+	}
+	return v, nil
 }
 
 func bindCommonFlags(fs *flag.FlagSet) *commandContext {
@@ -1983,6 +2126,8 @@ Commands:
   def       Resolve a symbol definition
   refs      List symbol references
   context   Build a small contextual bundle around a search hit
+  update    Check for and install the latest release
+  version   Print current wave version
 `)
 }
 

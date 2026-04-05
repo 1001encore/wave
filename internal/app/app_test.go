@@ -451,3 +451,41 @@ func TestSearchHitsOutputUsesPrecomputedSoftmaxWhenPresent(t *testing.T) {
 		t.Fatalf("softmax probabilities = %.3f %.3f, want 0.700 0.300", *out[0].SoftmaxProbability, *out[1].SoftmaxProbability)
 	}
 }
+
+func TestCurrentVersionDefaultsToDevWhenUnset(t *testing.T) {
+	original := version
+	t.Cleanup(func() {
+		version = original
+	})
+
+	version = ""
+	if got := currentVersion(); got != defaultVersion {
+		t.Fatalf("currentVersion() = %q, want %q", got, defaultVersion)
+	}
+}
+
+func TestVersionForUpdateValidation(t *testing.T) {
+	original := version
+	t.Cleanup(func() {
+		version = original
+	})
+
+	version = "dev"
+	if _, err := versionForUpdate(); err == nil {
+		t.Fatal("versionForUpdate() error = nil, want error for dev version")
+	}
+
+	version = "not-semver"
+	if _, err := versionForUpdate(); err == nil {
+		t.Fatal("versionForUpdate() error = nil, want semver error")
+	}
+
+	version = "v1.2.3"
+	got, err := versionForUpdate()
+	if err != nil {
+		t.Fatalf("versionForUpdate() unexpected error: %v", err)
+	}
+	if got != "v1.2.3" {
+		t.Fatalf("versionForUpdate() = %q, want %q", got, "v1.2.3")
+	}
+}

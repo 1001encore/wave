@@ -87,7 +87,7 @@ jobs:
           CC: ${{ matrix.asset_os == 'linux' && matrix.goarch == 'arm64' && 'aarch64-linux-gnu-gcc' || '' }}
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/wave${{ matrix.exe }}" ./cmd/wave
+          go build -trimpath -ldflags "-s -w -X github.com/1001encore/wave/internal/app.version=${{ github.ref_name }}" -o "dist/wave${{ matrix.exe }}" ./cmd/wave
 
       - name: Build (Windows)
         if: matrix.asset_os == 'windows'
@@ -98,7 +98,7 @@ jobs:
           export CXX="g++"
           export PKG_CONFIG_PATH="/mingw64/lib/pkgconfig"
           mkdir -p dist
-          go build -trimpath -ldflags "-s -w" -o "dist/wave.exe" ./cmd/wave
+          go build -trimpath -ldflags "-s -w -X github.com/1001encore/wave/internal/app.version=${{ github.ref_name }}" -o "dist/wave.exe" ./cmd/wave
 
       - name: Package tarball
         if: matrix.archive == 'tar.gz'
