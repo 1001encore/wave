@@ -101,10 +101,10 @@ func (r *Router) Search(ctx context.Context, rootPath string, query string, limi
 
 	switch mode {
 	case QueryModeSymbol:
-		return r.runSearch(ctx, rootPath, query, limit, mode, "symbol-centric retrieval was explicitly requested", searchOptions{
+		return r.runSearch(ctx, rootPath, query, limit, mode, "symbol-only retrieval was explicitly requested", searchOptions{
 			exactSymbols:   true,
 			lexicalSymbols: true,
-			semantic:       true,
+			semantic:       false,
 			graphExpand:    false,
 			lexicalChunks:  false,
 			confidenceGate: false,

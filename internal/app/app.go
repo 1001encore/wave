@@ -297,9 +297,12 @@ func runSearch(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	embedder, err := embed.ResolveONNXProvider(rootPath, cc.device)
-	if err != nil {
-		return fail(err)
+	var embedder embed.Provider = embed.NoopProvider{}
+	if modeNeedsSemanticEmbedding(cc.mode) {
+		embedder, err = embed.ResolveONNXProvider(rootPath, cc.device)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	router := queryrouter.NewRouter(st, embedder)
 	result, err := router.Search(ctx, rootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
@@ -518,9 +521,12 @@ func runContext(ctx context.Context, args []string) int {
 	}
 	defer st.Close()
 
-	embedder, err := embed.ResolveONNXProvider(rootPath, cc.device)
-	if err != nil {
-		return fail(err)
+	var embedder embed.Provider = embed.NoopProvider{}
+	if modeNeedsSemanticEmbedding(cc.mode) {
+		embedder, err = embed.ResolveONNXProvider(rootPath, cc.device)
+		if err != nil {
+			return fail(err)
+		}
 	}
 	router := queryrouter.NewRouter(st, embedder)
 	result, err := router.Context(ctx, rootPath, query, cc.limit, queryrouter.QueryMode(cc.mode))
@@ -1940,6 +1946,17 @@ func searchCodePreview(headerText string, maxChars int) string {
 		line = line[:maxChars]
 	}
 	return line + "..."
+}
+
+func modeNeedsSemanticEmbedding(mode string) bool {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "", "auto", "hybrid", "semantic", "graph":
+		return true
+	case "symbol":
+		return false
+	default:
+		return false
+	}
 }
 
 func min(a, b int) int {

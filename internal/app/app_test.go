@@ -206,6 +206,27 @@ func TestBindCommonFlagsWithLimitOverridesDefault(t *testing.T) {
 	}
 }
 
+func TestModeNeedsSemanticEmbedding(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{mode: "", want: true},
+		{mode: "auto", want: true},
+		{mode: "hybrid", want: true},
+		{mode: "semantic", want: true},
+		{mode: "graph", want: true},
+		{mode: "symbol", want: false},
+		{mode: "SYMBOL", want: false},
+		{mode: "unknown", want: false},
+	}
+	for _, tc := range cases {
+		if got := modeNeedsSemanticEmbedding(tc.mode); got != tc.want {
+			t.Fatalf("modeNeedsSemanticEmbedding(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
 func TestIndexerInstallSpecForAdapter(t *testing.T) {
 	tests := []struct {
 		adapterID  string

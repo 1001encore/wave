@@ -144,10 +144,11 @@ def main() -> int:
     requested_batch_size = int(request.get("batch_size", 0))
     device = request.get("device", "")
 
-    preload_started_at = time.perf_counter()
-    preload_cuda_dependencies()
-    preload_ms = (time.perf_counter() - preload_started_at) * 1000.0
     providers = select_execution_providers(device)
+    preload_started_at = time.perf_counter()
+    if providers and providers[0] != "CPUExecutionProvider":
+        preload_cuda_dependencies()
+    preload_ms = (time.perf_counter() - preload_started_at) * 1000.0
     batch_size = resolve_batch_size(requested_batch_size, providers)
 
     tokenizer = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
