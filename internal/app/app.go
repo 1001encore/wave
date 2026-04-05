@@ -91,6 +91,9 @@ const (
 	defaultResultLimit          = 10
 	defaultDefLimit             = 3
 	defaultRefsLimit            = 3
+	defaultAdaptiveClipMinKeep  = 3
+	adaptiveClipSoftmaxFloor    = 0.85
+	adaptiveClipNextProbCeiling = 0.05
 	releaseRepoOwner            = "1001encore"
 	releaseRepoName             = "wave"
 	defaultVersion              = "dev"
@@ -297,6 +300,12 @@ func runSearch(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
+	limitExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "limit" {
+			limitExplicit = true
+		}
+	})
 	query := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if query == "" {
 		return fail(errors.New("search query is required"))
@@ -323,6 +332,10 @@ func runSearch(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
+	clippedMatches := false
+	if shouldApplyDefaultAdaptiveClip(cc.limit, limitExplicit) {
+		result.Hits, clippedMatches = clipSearchHitsBySoftmax(result.Hits)
+	}
 	printFreshnessWarning(ctx, st, units, cc)
 	if cc.jsonOut {
 		printJSON(searchJSONPayload(result, showScore, showSoftmax, cc.explain))
@@ -340,7 +353,11 @@ func runSearch(ctx context.Context, args []string) int {
 	if showSoftmax {
 		softmax = outputSoftmaxProbabilities(result.Hits)
 	}
-	fmt.Printf("Matches: %d\n", len(result.Hits))
+	if clippedMatches {
+		fmt.Printf("Top Matches: %d, use --limit to show more\n", len(result.Hits))
+	} else {
+		fmt.Printf("Matches: %d\n", len(result.Hits))
+	}
 	for i, hit := range result.Hits {
 		displayPath := formatSearchDisplayPath(rootPath, hit.Path)
 		kind := prettifySearchKind(hit.Kind)
@@ -2269,6 +2286,61 @@ func outputSoftmaxProbabilities(hits []store.SearchHit) []float64 {
 		return probs
 	}
 	return softmaxProbabilities(hits)
+}
+
+func shouldApplyDefaultAdaptiveClip(limit int, limitExplicit bool) bool {
+	if limitExplicit {
+		return false
+	}
+	return limit == defaultResultLimit
+}
+
+func clipSearchHitsBySoftmax(hits []store.SearchHit) ([]store.SearchHit, bool) {
+	if len(hits) <= defaultAdaptiveClipMinKeep {
+		return hits, false
+	}
+	probs := outputSoftmaxProbabilities(hits)
+	if len(probs) != len(hits) {
+		return hits, false
+	}
+
+	cumulative := 0.0
+	for i, prob := range probs {
+		cumulative += prob
+		keep := i + 1
+		if keep < defaultAdaptiveClipMinKeep {
+			continue
+		}
+		if cumulative < adaptiveClipSoftmaxFloor || keep >= len(probs) {
+			continue
+		}
+		if probs[keep] > adaptiveClipNextProbCeiling {
+			continue
+		}
+		clipped := append([]store.SearchHit(nil), hits[:keep]...)
+		renormalizeSoftmaxProbabilities(clipped)
+		return clipped, true
+	}
+	return hits, false
+}
+
+func renormalizeSoftmaxProbabilities(hits []store.SearchHit) {
+	if len(hits) == 0 {
+		return
+	}
+	total := 0.0
+	for _, hit := range hits {
+		if hit.SoftmaxProbability <= 0 {
+			return
+		}
+		total += hit.SoftmaxProbability
+	}
+	if total <= 0 {
+		return
+	}
+	for i := range hits {
+		hits[i].SoftmaxProbability /= total
+	}
 }
 
 func adapterByID(id string) indexer.Adapter {

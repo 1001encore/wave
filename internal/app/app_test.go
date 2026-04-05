@@ -452,6 +452,60 @@ func TestSearchHitsOutputUsesPrecomputedSoftmaxWhenPresent(t *testing.T) {
 	}
 }
 
+func TestShouldApplyDefaultAdaptiveClip(t *testing.T) {
+	if shouldApplyDefaultAdaptiveClip(defaultResultLimit, false) != true {
+		t.Fatal("expected adaptive clip to apply for implicit default limit")
+	}
+	if shouldApplyDefaultAdaptiveClip(defaultResultLimit, true) {
+		t.Fatal("expected explicit --limit to disable adaptive clip")
+	}
+	if shouldApplyDefaultAdaptiveClip(defaultResultLimit+1, false) {
+		t.Fatal("expected non-default limits to disable adaptive clip")
+	}
+}
+
+func TestClipSearchHitsBySoftmaxClipsDominatedTail(t *testing.T) {
+	hits := []store.SearchHit{
+		{ChunkID: 1, SoftmaxProbability: 0.95},
+		{ChunkID: 2, SoftmaxProbability: 0.004},
+		{ChunkID: 3, SoftmaxProbability: 0.003},
+		{ChunkID: 4, SoftmaxProbability: 0.003},
+		{ChunkID: 5, SoftmaxProbability: 0.002},
+	}
+
+	clipped, changed := clipSearchHitsBySoftmax(hits)
+	if !changed {
+		t.Fatal("expected dominated tail to be clipped")
+	}
+	if len(clipped) != 3 {
+		t.Fatalf("clipped len = %d, want 3", len(clipped))
+	}
+	sum := 0.0
+	for _, hit := range clipped {
+		sum += hit.SoftmaxProbability
+	}
+	if math.Abs(sum-1.0) > 1e-9 {
+		t.Fatalf("renormalized softmax sum = %.12f, want 1.0", sum)
+	}
+}
+
+func TestClipSearchHitsBySoftmaxKeepsMeaningfulTail(t *testing.T) {
+	hits := []store.SearchHit{
+		{ChunkID: 1, SoftmaxProbability: 0.86},
+		{ChunkID: 2, SoftmaxProbability: 0.05},
+		{ChunkID: 3, SoftmaxProbability: 0.02},
+		{ChunkID: 4, SoftmaxProbability: 0.07},
+	}
+
+	clipped, changed := clipSearchHitsBySoftmax(hits)
+	if changed {
+		t.Fatal("expected meaningful next-tail probability to prevent clipping")
+	}
+	if len(clipped) != len(hits) {
+		t.Fatalf("hit count changed unexpectedly: got %d want %d", len(clipped), len(hits))
+	}
+}
+
 func TestCurrentVersionDefaultsToDevWhenUnset(t *testing.T) {
 	original := version
 	t.Cleanup(func() {
