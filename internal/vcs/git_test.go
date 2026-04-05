@@ -103,6 +103,25 @@ func TestSourceFilesUsesGitWhenAvailable(t *testing.T) {
 	}
 }
 
+func TestSourceFilesHonorsSkipDirsWithGit(t *testing.T) {
+	root := t.TempDir()
+	mustGitInit(t, root)
+
+	mustWriteFile(t, filepath.Join(root, "main.go"), []byte("package main\n"))
+	mustWriteFile(t, filepath.Join(root, "testdata", "fixture.go"), []byte("package fixture\n"))
+	mustGitAdd(t, root, ".")
+
+	files, err := SourceFiles(root, []string{".go"}, []string{"testdata", ".git", ".wave"})
+	if err != nil {
+		t.Fatalf("source files: %v", err)
+	}
+
+	want := []string{"main.go"}
+	if !reflect.DeepEqual(files, want) {
+		t.Fatalf("files = %v, want %v", files, want)
+	}
+}
+
 func TestSourceFilesFallsBackWithoutGit(t *testing.T) {
 	root := t.TempDir()
 	mustWriteFile(t, filepath.Join(root, "main.go"), []byte("package main\n"))

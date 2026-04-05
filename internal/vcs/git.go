@@ -134,6 +134,7 @@ func SourceFiles(root string, extensions []string, fallbackSkipDirs []string) ([
 	if err != nil {
 		return nil, err
 	}
+	files = filterSkippedDirs(files, fallbackSkipDirs)
 	return filterIgnored(files, rules), nil
 }
 
@@ -148,4 +149,36 @@ func matchesExtensions(path string, extensions []string) bool {
 		}
 	}
 	return false
+}
+
+func filterSkippedDirs(files []string, skipDirs []string) []string {
+	if len(skipDirs) == 0 || len(files) == 0 {
+		return files
+	}
+	skipSet := make(map[string]struct{}, len(skipDirs))
+	for _, dir := range skipDirs {
+		if dir == "" {
+			continue
+		}
+		skipSet[dir] = struct{}{}
+	}
+	if len(skipSet) == 0 {
+		return files
+	}
+
+	filtered := make([]string, 0, len(files))
+	for _, file := range files {
+		parts := strings.Split(filepath.ToSlash(file), "/")
+		skip := false
+		for _, part := range parts[:len(parts)-1] {
+			if _, ok := skipSet[part]; ok {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			filtered = append(filtered, file)
+		}
+	}
+	return filtered
 }
