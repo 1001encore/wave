@@ -318,11 +318,12 @@ func TestIndexerInstallSpecForAdapter(t *testing.T) {
 }
 
 func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
+	root := t.TempDir()
 	def := &store.DefinitionResult{
 		SymbolID:    1,
 		DisplayName: "greet",
 		Kind:        "function",
-		Path:        "/tmp/a.py",
+		Path:        filepath.Join(root, "a.py"),
 		StartLine:   0,
 		StartCol:    0,
 		DocSummary:  "python",
@@ -331,14 +332,14 @@ func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
 		Definition: def,
 		Candidates: []store.DefinitionResult{
 			*def,
-			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: "/tmp/b.ts", StartLine: 10, StartCol: 3},
-			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: "/tmp/c.rb", StartLine: 20, StartCol: 5},
-			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: "/tmp/d.go", StartLine: 30, StartCol: 7},
+			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "b.ts"), StartLine: 10, StartCol: 3},
+			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "c.rb"), StartLine: 20, StartCol: 5},
+			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "d.go"), StartLine: 30, StartCol: 7},
 		},
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, "/tmp", "greet", result, true, 3)
+	writeDefinitionOutput(&buf, root, "greet", result, true, 3)
 	out := buf.String()
 
 	if !strings.Contains(out, "Definition: greet [function]") {
@@ -359,24 +360,25 @@ func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
 }
 
 func TestWriteDefinitionOutputRespectsAlternateLimit(t *testing.T) {
+	root := t.TempDir()
 	def := &store.DefinitionResult{
 		SymbolID:    1,
 		DisplayName: "greet",
 		Kind:        "function",
-		Path:        "/tmp/a.py",
+		Path:        filepath.Join(root, "a.py"),
 	}
 	result := queryrouter.DefinitionResult{
 		Definition: def,
 		Candidates: []store.DefinitionResult{
 			*def,
-			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: "/tmp/b.ts", StartLine: 10, StartCol: 3},
-			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: "/tmp/c.rb", StartLine: 20, StartCol: 5},
-			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: "/tmp/d.go", StartLine: 30, StartCol: 7},
+			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "b.ts"), StartLine: 10, StartCol: 3},
+			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "c.rb"), StartLine: 20, StartCol: 5},
+			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "d.go"), StartLine: 30, StartCol: 7},
 		},
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, "/tmp", "greet", result, false, 2)
+	writeDefinitionOutput(&buf, root, "greet", result, false, 2)
 	out := buf.String()
 
 	if !strings.Contains(out, "./b.ts:11:4") || !strings.Contains(out, "./c.rb:21:6") {
