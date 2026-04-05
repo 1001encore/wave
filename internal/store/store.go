@@ -34,6 +34,7 @@ type ProjectData struct {
 	ScipArtifactPath  string
 	ToolName          string
 	ToolVersion       string
+	GitCommitHash     string
 }
 
 type FileData struct {
@@ -251,19 +252,20 @@ func (s *Store) migrate() error {
 	stmts := []string{
 		`PRAGMA foreign_keys = ON;`,
 		`CREATE TABLE IF NOT EXISTS projects (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			root_path TEXT NOT NULL,
-			name TEXT NOT NULL,
-			language TEXT NOT NULL,
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				root_path TEXT NOT NULL,
+				name TEXT NOT NULL,
+				language TEXT NOT NULL,
 			manifest_path TEXT NOT NULL,
 			environment_source TEXT NOT NULL,
 			adapter_id TEXT NOT NULL DEFAULT '',
-			scip_artifact_path TEXT NOT NULL,
-			tool_name TEXT NOT NULL,
-			tool_version TEXT NOT NULL,
-			last_indexed_at TEXT NOT NULL,
-			UNIQUE(root_path, adapter_id)
-		);`,
+				scip_artifact_path TEXT NOT NULL,
+				tool_name TEXT NOT NULL,
+				tool_version TEXT NOT NULL,
+				last_indexed_at TEXT NOT NULL,
+				git_commit_hash TEXT NOT NULL DEFAULT '',
+				UNIQUE(root_path, adapter_id)
+			);`,
 		`CREATE TABLE IF NOT EXISTS files (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -383,6 +385,9 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN adapter_id TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("migrate adapter_id column: %w", err)
 	}
+	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN git_commit_hash TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("migrate git_commit_hash column: %w", err)
+	}
 	if err := s.migrateLegacyProjectUniqueness(); err != nil {
 		return err
 	}
@@ -437,27 +442,28 @@ func (s *Store) migrateLegacyProjectUniqueness() error {
 
 	stmts := []string{
 		`CREATE TABLE projects_new (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			root_path TEXT NOT NULL,
-			name TEXT NOT NULL,
-			language TEXT NOT NULL,
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				root_path TEXT NOT NULL,
+				name TEXT NOT NULL,
+				language TEXT NOT NULL,
 			manifest_path TEXT NOT NULL,
 			environment_source TEXT NOT NULL,
 			adapter_id TEXT NOT NULL DEFAULT '',
-			scip_artifact_path TEXT NOT NULL,
-			tool_name TEXT NOT NULL,
-			tool_version TEXT NOT NULL,
-			last_indexed_at TEXT NOT NULL,
-			UNIQUE(root_path, adapter_id)
-		);`,
+				scip_artifact_path TEXT NOT NULL,
+				tool_name TEXT NOT NULL,
+				tool_version TEXT NOT NULL,
+				last_indexed_at TEXT NOT NULL,
+				git_commit_hash TEXT NOT NULL DEFAULT '',
+				UNIQUE(root_path, adapter_id)
+			);`,
 		`INSERT INTO projects_new (
-			id, root_path, name, language, manifest_path, environment_source, adapter_id,
-			scip_artifact_path, tool_name, tool_version, last_indexed_at
-		)
-		SELECT
-			id, root_path, name, language, manifest_path, environment_source, adapter_id,
-			scip_artifact_path, tool_name, tool_version, last_indexed_at
-		FROM projects;`,
+				id, root_path, name, language, manifest_path, environment_source, adapter_id,
+				scip_artifact_path, tool_name, tool_version, last_indexed_at, git_commit_hash
+			)
+			SELECT
+				id, root_path, name, language, manifest_path, environment_source, adapter_id,
+				scip_artifact_path, tool_name, tool_version, last_indexed_at, COALESCE(git_commit_hash, '')
+			FROM projects;`,
 		`DROP TABLE projects;`,
 		`ALTER TABLE projects_new RENAME TO projects;`,
 	}
@@ -507,8 +513,8 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 		ctx,
 		`INSERT INTO projects (
 			root_path, name, language, manifest_path, environment_source, adapter_id, scip_artifact_path,
-			tool_name, tool_version, last_indexed_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			tool_name, tool_version, last_indexed_at, git_commit_hash
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cleanRoot,
 		payload.Project.Name,
 		payload.Project.Language,
@@ -519,6 +525,7 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 		payload.Project.ToolName,
 		payload.Project.ToolVersion,
 		now,
+		payload.Project.GitCommitHash,
 	)
 	if err != nil {
 		return fmt.Errorf("insert project: %w", err)
@@ -895,6 +902,29 @@ func (s *Store) Status(ctx context.Context, rootPath string) ([]StatusRow, error
 		result = append(result, row)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) GitCommitHash(ctx context.Context, rootPath string, adapterID string) (string, error) {
+	cleanRoot := filepath.Clean(rootPath)
+	if err := s.ensureProjectsExist(ctx, cleanRoot); err != nil {
+		return "", err
+	}
+	query := `SELECT COALESCE(git_commit_hash, '') FROM projects WHERE root_path = ?`
+	args := []any{cleanRoot}
+	if strings.TrimSpace(adapterID) != "" {
+		query += ` AND adapter_id = ?`
+		args = append(args, adapterID)
+	}
+	query += ` LIMIT 1`
+	var hash string
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(&hash)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		return "", fmt.Errorf("query git commit hash: %w", err)
+	}
+	return hash, nil
 }
 
 func (s *Store) IndexedFiles(ctx context.Context, rootPath string, adapterID string) (map[string]IndexedFileRow, error) {

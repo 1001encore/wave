@@ -6,12 +6,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/1001encore/wave/internal/indexer"
 	"github.com/1001encore/wave/internal/store"
 	"github.com/1001encore/wave/internal/syntax"
+	"github.com/1001encore/wave/internal/vcs"
 	"github.com/1001encore/wave/internal/workspace"
 )
 
@@ -103,35 +103,7 @@ func (Adapter) Index(ctx context.Context, unit workspace.Unit, artifactPath stri
 }
 
 func (Adapter) SourceFiles(unit workspace.Unit) ([]string, error) {
-	var files []string
-	err := filepath.WalkDir(unit.RootPath, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", ".wave", "target":
-				if path != unit.RootPath {
-					return filepath.SkipDir
-				}
-			}
-			return nil
-		}
-		if strings.ToLower(filepath.Ext(path)) != ".rs" {
-			return nil
-		}
-		rel, relErr := filepath.Rel(unit.RootPath, path)
-		if relErr != nil {
-			return relErr
-		}
-		files = append(files, filepath.ToSlash(rel))
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(files)
-	return files, nil
+	return vcs.SourceFiles(unit.RootPath, []string{".rs"}, []string{".git", ".wave", "target"})
 }
 
 func (Adapter) SyntaxExtractor() syntax.Extractor {

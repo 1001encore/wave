@@ -32,6 +32,7 @@ import (
 	"github.com/1001encore/wave/internal/scipgraph"
 	"github.com/1001encore/wave/internal/store"
 	"github.com/1001encore/wave/internal/typescript"
+	"github.com/1001encore/wave/internal/vcs"
 	"github.com/1001encore/wave/internal/workspace"
 )
 
@@ -1349,6 +1350,8 @@ func buildPayload(
 	}
 	edges = append(edges, derivedEdges...)
 
+	gitHash, _ := vcs.HeadCommit(unit.RootPath)
+
 	return store.IndexPayload{
 		Project: store.ProjectData{
 			RootPath:          unit.RootPath,
@@ -1360,6 +1363,7 @@ func buildPayload(
 			ScipArtifactPath:  indexResult.ArtifactPath,
 			ToolName:          indexResult.ToolName,
 			ToolVersion:       indexResult.ToolVersion,
+			GitCommitHash:     gitHash,
 		},
 		Files:        files,
 		Symbols:      symbols,

@@ -133,6 +133,7 @@ func (p *ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, er
 
 	cmd := exec.CommandContext(ctx, p.PythonPath, p.ScriptPath)
 	cmd.Stdin = bytes.NewReader(payload)
+	cmd.Env = appendNvidiaLibPath(os.Environ(), p.PythonPath)
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -164,6 +165,13 @@ func (p *ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, er
 	header, payloadBytes, err := decodeONNXResponse(stdout.Bytes())
 	if err != nil {
 		return nil, err
+	}
+	if header.Provider == "CPUExecutionProvider" {
+		if isCUDADevice(p.Device) {
+			fmt.Fprintf(os.Stderr, "warning: CUDA was requested but embeddings fell back to CPU; install CUDA 12 + cuDNN 9 runtime libraries or run: %s -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-runtime-cu12 nvidia-cufft-cu12 nvidia-curand-cu12\n", p.PythonPath)
+		} else if strings.TrimSpace(strings.ToLower(p.Device)) != "cpu" {
+			fmt.Fprintln(os.Stderr, "info: embeddings are running on CPUExecutionProvider")
+		}
 	}
 	if header.Count != len(docs) {
 		return nil, fmt.Errorf("embedding count mismatch: got %d want %d", header.Count, len(docs))
@@ -407,6 +415,7 @@ func resolveModelDir(searchRoots []string) (string, error) {
 	if target == "" {
 		return "", fmt.Errorf("cannot resolve model cache directory")
 	}
+	fmt.Fprintf(os.Stderr, "info: embedding model not found locally; installing into %s\n", target)
 	if err := downloadModel(target); err != nil {
 		return "", err
 	}
@@ -428,17 +437,20 @@ func resolvePythonPath(searchRoots []string, device string) (string, error) {
 		if err := ensurePythonDeps(path); err == nil {
 			return path, nil
 		}
+		fmt.Fprintf(os.Stderr, "info: project python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
 	}
 	if path, err := exec.LookPath("python3"); err == nil {
 		if err := ensurePythonDeps(path); err == nil {
 			return path, nil
 		}
+		fmt.Fprintf(os.Stderr, "info: python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
 		return ensureEmbeddedRuntime(path, device)
 	}
 	if path, err := exec.LookPath("python"); err == nil {
 		if err := ensurePythonDeps(path); err == nil {
 			return path, nil
 		}
+		fmt.Fprintf(os.Stderr, "info: python runtime at %s is missing embedding dependencies; installing isolated embedding runtime\n", path)
 		return ensureEmbeddedRuntime(path, device)
 	}
 	return "", fmt.Errorf("python runtime not found; expected project .venv/bin/python or python3 on PATH")
@@ -462,6 +474,7 @@ func ensureEmbeddedScript() (string, error) {
 	}
 
 	tmpPath := scriptPath + ".tmp"
+	fmt.Fprintf(os.Stderr, "info: installing embedded onnx script to %s\n", scriptPath)
 	if err := os.WriteFile(tmpPath, embeddedONNXScript, 0o755); err != nil {
 		return "", fmt.Errorf("write embedded onnx script: %w", err)
 	}
@@ -502,6 +515,7 @@ func downloadModel(modelDir string) error {
 		if err := os.MkdirAll(filepath.Dir(targetPath), 0o755); err != nil {
 			return fmt.Errorf("create model subdirectory for %s: %w", rel, err)
 		}
+		fmt.Fprintf(os.Stderr, "info: downloading embedding model file %s\n", rel)
 		if err := downloadFile(client, modelURL(rel), targetPath); err != nil {
 			return fmt.Errorf("download %s: %w", rel, err)
 		}
@@ -576,6 +590,70 @@ func maxFloat64(a float64, b float64) float64 {
 	return b
 }
 
+func isCUDADevice(device string) bool {
+	return device == "cuda" || device == "gpu"
+}
+
+// appendNvidiaLibPath detects pip-installed nvidia CUDA libraries under the
+// Python runtime's site-packages and adds their lib dirs to LD_LIBRARY_PATH
+// so onnxruntime can find them at session-creation time.
+func appendNvidiaLibPath(environ []string, pythonPath string) []string {
+	cmd := exec.Command(pythonPath, "-c", `
+import pathlib, site, sys
+try:
+    sp = site.getsitepackages()
+except Exception:
+    sys.exit(0)
+for s in sp:
+    nvidia = pathlib.Path(s) / "nvidia"
+    if nvidia.is_dir():
+        dirs = sorted(set(str(p.parent) for p in nvidia.rglob("*.so*") if p.is_file()))
+        if dirs:
+            print(":".join(dirs))
+            break
+`)
+	out, err := cmd.Output()
+	if err != nil {
+		return environ
+	}
+	extra := strings.TrimSpace(string(out))
+	if extra == "" {
+		return environ
+	}
+
+	for i, env := range environ {
+		if strings.HasPrefix(env, "LD_LIBRARY_PATH=") {
+			environ[i] = "LD_LIBRARY_PATH=" + extra + ":" + env[len("LD_LIBRARY_PATH="):]
+			return environ
+		}
+	}
+	return append(environ, "LD_LIBRARY_PATH="+extra)
+}
+
+func ensureNvidiaCUDALibs(pythonPath string) {
+	packages := []string{
+		"nvidia-cublas-cu12",
+		"nvidia-cudnn-cu12",
+		"nvidia-cuda-runtime-cu12",
+		"nvidia-cufft-cu12",
+		"nvidia-curand-cu12",
+	}
+	fmt.Fprintf(os.Stderr, "info: ensuring NVIDIA CUDA runtime libraries in %s\n", pythonPath)
+	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check"}, packages...)
+	cmd := exec.Command(pythonPath, args...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"warning: failed to install NVIDIA CUDA runtime libraries for %s: %v\n%s\n",
+			pythonPath,
+			err,
+			strings.TrimSpace(string(output)),
+		)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "info: NVIDIA CUDA runtime libraries are installed")
+}
+
 func ensurePythonDeps(pythonPath string) error {
 	cmd := exec.Command(pythonPath, "-c", "import numpy, onnxruntime, tokenizers")
 	output, err := cmd.CombinedOutput()
@@ -597,9 +675,11 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 		if err := ensurePythonDeps(runtimePython); err == nil {
 			return runtimePython, nil
 		}
+		fmt.Fprintf(os.Stderr, "info: existing embedding runtime at %s is missing dependencies; reinstalling\n", runtimePython)
 	}
 
 	if !dirExists(runtimeDir) {
+		fmt.Fprintf(os.Stderr, "info: creating isolated embedding runtime at %s\n", runtimeDir)
 		cmd := exec.Command(basePython, "-m", "venv", runtimeDir)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			return "", fmt.Errorf("create embedding runtime: %w\n%s", err, strings.TrimSpace(string(output)))
@@ -607,21 +687,29 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 	}
 
 	packages := []string{"onnxruntime"}
-	if device == "cuda" || device == "gpu" {
+	if isCUDADevice(device) {
 		packages = []string{"onnxruntime-gpu", "onnxruntime"}
 	}
 	var installErr error
-	for _, onnxPackage := range packages {
+	for i, onnxPackage := range packages {
+		fmt.Fprintf(os.Stderr, "info: installing embedding dependencies with %s in %s\n", onnxPackage, runtimePython)
 		cmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "numpy", onnxPackage, "tokenizers")
 		if output, err := cmd.CombinedOutput(); err != nil {
+			if i+1 < len(packages) {
+				fmt.Fprintf(os.Stderr, "warning: failed to install %s; falling back to %s\n", onnxPackage, packages[i+1])
+			}
 			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w\n%s", onnxPackage, err, strings.TrimSpace(string(output)))
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "info: embedding dependencies installed with %s\n", onnxPackage)
 		installErr = nil
 		break
 	}
 	if installErr != nil {
 		return "", installErr
+	}
+	if isCUDADevice(device) {
+		ensureNvidiaCUDALibs(runtimePython)
 	}
 	if err := ensurePythonDeps(runtimePython); err != nil {
 		return "", err
