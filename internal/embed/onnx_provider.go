@@ -639,15 +639,12 @@ func ensureNvidiaCUDALibs(pythonPath string) {
 		"nvidia-curand-cu12",
 	}
 	fmt.Fprintf(os.Stderr, "info: ensuring NVIDIA CUDA runtime libraries in %s\n", pythonPath)
-	args := append([]string{"-m", "pip", "install", "--disable-pip-version-check"}, packages...)
-	cmd := exec.Command(pythonPath, args...)
-	if output, err := cmd.CombinedOutput(); err != nil {
+	if err := installRuntimePackagesWithUV(pythonPath, packages...); err != nil {
 		fmt.Fprintf(
 			os.Stderr,
-			"warning: failed to install NVIDIA CUDA runtime libraries for %s: %v\n%s\n",
+			"warning: failed to install NVIDIA CUDA runtime libraries for %s: %v\n",
 			pythonPath,
 			err,
-			strings.TrimSpace(string(output)),
 		)
 		return
 	}
@@ -692,13 +689,12 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 	}
 	var installErr error
 	for i, onnxPackage := range packages {
-		fmt.Fprintf(os.Stderr, "info: installing embedding dependencies with %s in %s\n", onnxPackage, runtimePython)
-		cmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "numpy", onnxPackage, "tokenizers")
-		if output, err := cmd.CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "info: installing embedding dependencies with uv (%s) in %s\n", onnxPackage, runtimePython)
+		if err := installRuntimePackagesWithUV(runtimePython, "numpy", onnxPackage, "tokenizers"); err != nil {
 			if i+1 < len(packages) {
 				fmt.Fprintf(os.Stderr, "warning: failed to install %s; falling back to %s\n", onnxPackage, packages[i+1])
 			}
-			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w\n%s", onnxPackage, err, strings.TrimSpace(string(output)))
+			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w", onnxPackage, err)
 			continue
 		}
 		fmt.Fprintf(os.Stderr, "info: embedding dependencies installed with %s\n", onnxPackage)
@@ -715,4 +711,32 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 		return "", err
 	}
 	return runtimePython, nil
+}
+
+func installRuntimePackagesWithUV(runtimePython string, packages ...string) error {
+	if err := ensureRuntimeUV(runtimePython); err != nil {
+		return err
+	}
+	args := append([]string{"-m", "uv", "pip", "install", "--python", runtimePython}, packages...)
+	cmd := exec.Command(runtimePython, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("install packages with uv: %w\n%s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func ensureRuntimeUV(runtimePython string) error {
+	checkCmd := exec.Command(runtimePython, "-m", "uv", "--version")
+	if err := checkCmd.Run(); err == nil {
+		return nil
+	}
+
+	fmt.Fprintf(os.Stderr, "info: uv not found in embedding runtime; installing uv in %s\n", runtimePython)
+	installCmd := exec.Command(runtimePython, "-m", "pip", "install", "--disable-pip-version-check", "uv")
+	output, err := installCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("install uv in embedding runtime: %w\n%s", err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }

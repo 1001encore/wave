@@ -81,7 +81,10 @@ wave refs processData
 
 If a required installer toolchain is missing (for example `go`, `rustup`, or `coursier`), `wave` returns a clear error describing what to install.
 
-Embeddings use ONNX with `all-MiniLM-L6-v2-code-search-512` (size of ~90MB, downloaded first time only). `wave` bootstraps a local Python environment for embedding dependencies when needed.
+- Python 3 is required for embedding-backed workflows (`index`, `search`, `context`, and auto-reindex triggered before query commands).
+- Embeddings use ONNX with `all-MiniLM-L6-v2-code-search-512` (size of ~90MB, downloaded first time only).
+- `wave` uses a Wave-managed runtime (`~/.cache/wave/runtime`) for embedding dependencies when the project runtime is missing them.
+- Package installation inside that Wave-managed runtime uses `uv` (`uv pip`).
 
 ## Notes
 
