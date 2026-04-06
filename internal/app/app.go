@@ -2190,9 +2190,6 @@ func printJSON(payload any) {
 }
 
 type searchHitOutput struct {
-	ChunkID            int64    `json:"chunk_id"`
-	FileID             int64    `json:"file_id"`
-	PrimarySymbolID    int64    `json:"primary_symbol_id"`
 	Path               string   `json:"path"`
 	StartLine          int      `json:"start_line"`
 	EndLine            int      `json:"end_line"`
@@ -2228,9 +2225,6 @@ func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax 
 	}
 	for i, hit := range hits {
 		item := searchHitOutput{
-			ChunkID:         hit.ChunkID,
-			FileID:          hit.FileID,
-			PrimarySymbolID: hit.PrimarySymbolID,
 			Path:            hit.Path,
 			StartLine:       hit.StartLine,
 			EndLine:         hit.EndLine,

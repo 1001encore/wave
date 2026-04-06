@@ -151,9 +151,9 @@ type IndexedFileRow struct {
 type RelatedChunk struct {
 	RelationKind string  `json:"relation_kind"`
 	Direction    string  `json:"direction"`
-	ChunkID      int64   `json:"chunk_id"`
-	FileID       int64   `json:"file_id"`
-	SymbolID     int64   `json:"symbol_id"`
+	ChunkID      int64   `json:"-"`
+	FileID       int64   `json:"-"`
+	SymbolID     int64   `json:"-"`
 	Path         string  `json:"path"`
 	StartLine    int     `json:"start_line"`
 	EndLine      int     `json:"end_line"`
@@ -165,16 +165,16 @@ type RelatedChunk struct {
 }
 
 type ChunkSymbolLink struct {
-	ChunkID  int64   `json:"chunk_id"`
-	SymbolID int64   `json:"symbol_id"`
+	ChunkID  int64   `json:"-"`
+	SymbolID int64   `json:"-"`
 	Role     string  `json:"role"`
 	Weight   float64 `json:"weight"`
 }
 
 type SearchHit struct {
-	ChunkID            int64   `json:"chunk_id"`
-	FileID             int64   `json:"file_id"`
-	PrimarySymbolID    int64   `json:"primary_symbol_id"`
+	ChunkID            int64   `json:"-"`
+	FileID             int64   `json:"-"`
+	PrimarySymbolID    int64   `json:"-"`
 	Path               string  `json:"path"`
 	StartLine          int     `json:"start_line"`
 	EndLine            int     `json:"end_line"`
@@ -187,7 +187,7 @@ type SearchHit struct {
 }
 
 type SymbolSearchHit struct {
-	SymbolID    int64   `json:"symbol_id"`
+	SymbolID    int64   `json:"-"`
 	ScipSymbol  string  `json:"scip_symbol"`
 	DisplayName string  `json:"display_name"`
 	Kind        string  `json:"kind"`
@@ -203,7 +203,7 @@ type SymbolSearchHit struct {
 }
 
 type DefinitionResult struct {
-	SymbolID    int64  `json:"symbol_id"`
+	SymbolID    int64  `json:"-"`
 	ScipSymbol  string `json:"scip_symbol"`
 	DisplayName string `json:"display_name"`
 	Kind        string `json:"kind"`
@@ -218,7 +218,7 @@ type DefinitionResult struct {
 }
 
 type ReferenceResult struct {
-	SymbolID    int64  `json:"symbol_id"`
+	SymbolID    int64  `json:"-"`
 	DisplayName string `json:"display_name"`
 	Path        string `json:"path"`
 	StartLine   int    `json:"start_line"`
