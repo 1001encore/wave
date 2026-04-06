@@ -1497,10 +1497,16 @@ func buildPayload(
 	}
 
 	assignPrimarySymbols(chunks, defs, symbolMap, adapter.NormalizeDisplayName)
-	for i := range chunks {
-		chunks[i].RetrievalText = buildRetrievalText(chunks[i], symbolMap[chunks[i].PrimarySymbol])
-	}
 	chunkSymbols := deriveChunkSymbolLinks(chunks, occurrences)
+
+	chunkSymbolsByKey := map[string][]store.ChunkSymbolLinkData{}
+	for _, link := range chunkSymbols {
+		chunkSymbolsByKey[link.ChunkKey] = append(chunkSymbolsByKey[link.ChunkKey], link)
+	}
+
+	for i := range chunks {
+		chunks[i].RetrievalText = buildRetrievalText(chunks[i], symbolMap[chunks[i].PrimarySymbol], chunkSymbolsByKey[chunks[i].Key], symbolMap, edges)
+	}
 
 	embedDocs := make([]embed.Document, 0, len(chunks))
 	for _, chunk := range chunks {
@@ -1610,7 +1616,13 @@ func pathWithinRoot(rootPath string, candidatePath string) bool {
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
+func buildRetrievalText(
+	chunk store.ChunkData,
+	symbol store.SymbolData,
+	chunkLinks []store.ChunkSymbolLinkData,
+	symbolMap map[string]store.SymbolData,
+	edges []store.EdgeData,
+) string {
 	var b strings.Builder
 	b.WriteString("file: ")
 	b.WriteString(chunk.FilePath)
@@ -1624,9 +1636,70 @@ func buildRetrievalText(chunk store.ChunkData, symbol store.SymbolData) string {
 		b.WriteString("\nsymbol: ")
 		b.WriteString(symbol.ScipSymbol)
 	}
+	if symbol.Signature != "" {
+		b.WriteString("\nsignature: ")
+		b.WriteString(symbol.Signature)
+	}
+	if symbol.EnclosingSymbol != "" {
+		if parent, ok := symbolMap[symbol.EnclosingSymbol]; ok && parent.DisplayName != "" {
+			b.WriteString("\nparent: ")
+			b.WriteString(parent.DisplayName)
+		}
+	}
+	if symbol.ScipSymbol != "" {
+		var rels []string
+		for _, edge := range edges {
+			if edge.SrcSymbol != symbol.ScipSymbol {
+				continue
+			}
+			if edge.Kind != "implementation" && edge.Kind != "type_definition" {
+				continue
+			}
+			dst, ok := symbolMap[edge.DstSymbol]
+			if !ok || dst.DisplayName == "" {
+				continue
+			}
+			switch edge.Kind {
+			case "implementation":
+				rels = append(rels, "implements "+dst.DisplayName)
+			case "type_definition":
+				rels = append(rels, "type "+dst.DisplayName)
+			}
+		}
+		if len(rels) > 0 {
+			b.WriteString("\nrelationships: ")
+			b.WriteString(strings.Join(rels, ", "))
+		}
+	}
 	if symbol.DocSummary != "" {
 		b.WriteString("\ndoc: ")
 		b.WriteString(symbol.DocSummary)
+	}
+	if len(chunkLinks) > 0 {
+		seen := map[string]struct{}{}
+		var refs []string
+		for _, link := range chunkLinks {
+			if link.Role == "defines" {
+				continue
+			}
+			dst, ok := symbolMap[link.Symbol]
+			name := link.Symbol
+			if ok && dst.DisplayName != "" {
+				name = dst.DisplayName
+			}
+			if _, dup := seen[name]; dup {
+				continue
+			}
+			seen[name] = struct{}{}
+			refs = append(refs, name)
+			if len(refs) >= 15 {
+				break
+			}
+		}
+		if len(refs) > 0 {
+			b.WriteString("\nreferences: ")
+			b.WriteString(strings.Join(refs, ", "))
+		}
 	}
 	b.WriteString("\ncode:\n")
 	b.WriteString(chunk.Text)
@@ -1949,12 +2022,16 @@ func toSymbolData(
 	filePath string,
 	normalizeDisplayName func(string) string,
 ) store.SymbolData {
+	var signature string
+	if sigDoc := info.GetSignatureDocumentation(); sigDoc != nil && sigDoc.GetText() != "" {
+		signature = sigDoc.GetText()
+	}
 	data := store.SymbolData{
 		ScipSymbol:      info.GetSymbol(),
 		DisplayName:     firstNonEmpty(info.GetDisplayName(), normalizeDisplayName(info.GetSymbol())),
 		Kind:            firstNonEmpty(scipgraph.NormalizeSymbolKind(info.GetKind()), "symbol"),
 		FilePath:        filePath,
-		Signature:       "",
+		Signature:       signature,
 		DocSummary:      scipgraph.DocumentationSummary(info.GetDocumentation()),
 		EnclosingSymbol: info.GetEnclosingSymbol(),
 	}
