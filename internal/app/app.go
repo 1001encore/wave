@@ -1624,35 +1624,50 @@ func buildRetrievalText(
 	edges []store.EdgeData,
 ) string {
 	var b strings.Builder
-	b.WriteString("file: ")
-	b.WriteString(chunk.FilePath)
-	b.WriteString("\nkind: ")
-	b.WriteString(chunk.Kind)
-	if chunk.Name != "" {
-		b.WriteString("\nname: ")
-		b.WriteString(chunk.Name)
+
+	// Natural-language preamble describing the chunk identity.
+	displayName := symbol.DisplayName
+	if displayName == "" {
+		displayName = chunk.Name
 	}
-	if symbol.ScipSymbol != "" {
-		b.WriteString("\nsymbol: ")
-		b.WriteString(symbol.ScipSymbol)
+	kindLabel := strings.ReplaceAll(chunk.Kind, "_", " ")
+
+	if displayName != "" {
+		b.WriteString(displayName)
+		b.WriteString(" is a ")
+		b.WriteString(kindLabel)
+		b.WriteString(" in ")
+		b.WriteString(chunk.FilePath)
+		b.WriteString(".")
+	} else {
+		b.WriteString("A ")
+		b.WriteString(kindLabel)
+		b.WriteString(" in ")
+		b.WriteString(chunk.FilePath)
+		b.WriteString(".")
 	}
+
+	// Signature from SCIP (e.g. "func(ctx Context, id int) error").
 	if symbol.Signature != "" {
-		b.WriteString("\nsignature: ")
+		b.WriteString(" Signature: ")
 		b.WriteString(symbol.Signature)
+		b.WriteString(".")
 	}
+
+	// Enclosing symbol as parent context.
 	if symbol.EnclosingSymbol != "" {
 		if parent, ok := symbolMap[symbol.EnclosingSymbol]; ok && parent.DisplayName != "" {
-			b.WriteString("\nparent: ")
+			b.WriteString(" Defined inside ")
 			b.WriteString(parent.DisplayName)
+			b.WriteString(".")
 		}
 	}
+
+	// Relationship annotations from SCIP edges.
 	if symbol.ScipSymbol != "" {
-		var rels []string
+		var impls, typeDefs []string
 		for _, edge := range edges {
 			if edge.SrcSymbol != symbol.ScipSymbol {
-				continue
-			}
-			if edge.Kind != "implementation" && edge.Kind != "type_definition" {
 				continue
 			}
 			dst, ok := symbolMap[edge.DstSymbol]
@@ -1661,49 +1676,83 @@ func buildRetrievalText(
 			}
 			switch edge.Kind {
 			case "implementation":
-				rels = append(rels, "implements "+dst.DisplayName)
+				impls = append(impls, dst.DisplayName)
 			case "type_definition":
-				rels = append(rels, "type "+dst.DisplayName)
+				typeDefs = append(typeDefs, dst.DisplayName)
 			}
 		}
-		if len(rels) > 0 {
-			b.WriteString("\nrelationships: ")
-			b.WriteString(strings.Join(rels, ", "))
+		if len(impls) > 0 {
+			b.WriteString(" Implements ")
+			b.WriteString(strings.Join(impls, ", "))
+			b.WriteString(".")
+		}
+		if len(typeDefs) > 0 {
+			b.WriteString(" Type defined by ")
+			b.WriteString(strings.Join(typeDefs, ", "))
+			b.WriteString(".")
 		}
 	}
+
+	// Documentation summary stripped of markdown code fences.
 	if symbol.DocSummary != "" {
-		b.WriteString("\ndoc: ")
-		b.WriteString(symbol.DocSummary)
+		clean := stripCodeFences(symbol.DocSummary)
+		if clean != "" {
+			b.WriteString(" ")
+			b.WriteString(clean)
+		}
 	}
+
+	// Referenced symbols from chunk-symbol links.
 	if len(chunkLinks) > 0 {
-		seen := map[string]struct{}{}
-		var refs []string
-		for _, link := range chunkLinks {
-			if link.Role == "defines" {
-				continue
-			}
-			dst, ok := symbolMap[link.Symbol]
-			name := link.Symbol
-			if ok && dst.DisplayName != "" {
-				name = dst.DisplayName
-			}
-			if _, dup := seen[name]; dup {
-				continue
-			}
-			seen[name] = struct{}{}
-			refs = append(refs, name)
-			if len(refs) >= 15 {
-				break
-			}
-		}
+		refs := collectReferenceNames(chunkLinks, symbolMap)
 		if len(refs) > 0 {
-			b.WriteString("\nreferences: ")
+			b.WriteString(" Uses ")
 			b.WriteString(strings.Join(refs, ", "))
+			b.WriteString(".")
 		}
 	}
-	b.WriteString("\ncode:\n")
+
+	b.WriteString("\n\n")
 	b.WriteString(chunk.Text)
 	return b.String()
+}
+
+func collectReferenceNames(links []store.ChunkSymbolLinkData, symbolMap map[string]store.SymbolData) []string {
+	seen := map[string]struct{}{}
+	var refs []string
+	for _, link := range links {
+		if link.Role == "defines" {
+			continue
+		}
+		name := link.Symbol
+		if dst, ok := symbolMap[link.Symbol]; ok && dst.DisplayName != "" {
+			name = dst.DisplayName
+		}
+		if _, dup := seen[name]; dup {
+			continue
+		}
+		seen[name] = struct{}{}
+		refs = append(refs, name)
+		if len(refs) >= 15 {
+			break
+		}
+	}
+	return refs
+}
+
+func stripCodeFences(s string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "```") {
+			continue
+		}
+		if trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 func formatIndexSummary(rootPath string, units []indexUnitSummary, totals indexTotals, stats *embed.Stats) string {
