@@ -1155,7 +1155,18 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 	totals := indexTotals{}
 	unitSummaries := make([]indexUnitSummary, 0, len(units))
 
-	for _, item := range units {
+	// 4 steps per unit: index, load, build payload, store
+	var pb *progressBar
+	if !cc.jsonOut {
+		if cc.device == "cuda" || cc.device == "gpu" {
+			fmt.Fprintln(os.Stderr, "GPU found, using CUDA")
+		} else {
+			fmt.Fprintln(os.Stderr, "GPU not found, falling back to CPU")
+		}
+		pb = newProgressBar(os.Stderr, len(units)*4, "Indexing")
+	}
+
+	for i, item := range units {
 		adapter := item.Adapter
 		unit := item.Unit
 
@@ -1163,24 +1174,49 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 			return nil, "", err
 		}
 
+		stepLabel := fmt.Sprintf("[%d/%d] indexing", i+1, len(units))
+		if pb != nil {
+			pb.SetDescription(stepLabel)
+		}
 		artifactPath := filepath.Join(paths.ArtifactDir, fmt.Sprintf("index.%s.scip", artifactSuffix(adapter.ID())))
 		indexResult, err := adapter.Index(ctx, unit, artifactPath)
 		if err != nil {
 			return nil, "", err
 		}
+		if pb != nil {
+			pb.Increment()
+		}
 
+		if pb != nil {
+			pb.SetDescription(fmt.Sprintf("[%d/%d] loading SCIP", i+1, len(units)))
+		}
 		index, err := scipgraph.LoadIndex(indexResult.ArtifactPath)
 		if err != nil {
 			return nil, "", err
 		}
+		if pb != nil {
+			pb.Increment()
+		}
 
+		if pb != nil {
+			pb.SetDescription(fmt.Sprintf("[%d/%d] building", i+1, len(units)))
+		}
 		payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embedder)
 		if err != nil {
 			return nil, "", err
 		}
+		if pb != nil {
+			pb.Increment()
+		}
 
+		if pb != nil {
+			pb.SetDescription(fmt.Sprintf("[%d/%d] storing", i+1, len(units)))
+		}
 		if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
 			return nil, "", err
+		}
+		if pb != nil {
+			pb.Increment()
 		}
 
 		if _, ok := seenAdapter[adapter.ID()]; !ok {
@@ -1223,6 +1259,10 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 			Edges:       edges,
 			Embeddings:  embeddings,
 		})
+	}
+
+	if pb != nil {
+		pb.Finish()
 	}
 
 	if err := st.DeleteProjectsExceptAdapters(ctx, rootPath, adapterIDs); err != nil {
@@ -1766,6 +1806,10 @@ func formatIndexSummary(rootPath string, units []indexUnitSummary, totals indexT
 		tw := tabwriter.NewWriter(&out, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(tw, "LANG\tADAPTER\tFILES\tSYMBOLS\tOCCURRENCES\tCHUNKS\tEDGES\tEMBEDS\tARTIFACT")
 		for _, item := range units {
+			relArtifact := item.Artifact
+			if rel, err := filepath.Rel(rootPath, item.Artifact); err == nil {
+				relArtifact = "." + string(filepath.Separator) + rel
+			}
 			fmt.Fprintf(
 				tw,
 				"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -1777,25 +1821,21 @@ func formatIndexSummary(rootPath string, units []indexUnitSummary, totals indexT
 				formatInt(item.Chunks),
 				formatInt(item.Edges),
 				formatInt(item.Embeddings),
-				item.Artifact,
+				relArtifact,
 			)
 		}
+		fmt.Fprintf(tw, "\t\t\t\t\t\t\t\t\n")
+		fmt.Fprintf(
+			tw,
+			"TOTAL\t\t%s\t%s\t%s\t%s\t%s\t%s\t\n",
+			formatInt(totals.Files),
+			formatInt(totals.Symbols),
+			formatInt(totals.Occurrences),
+			formatInt(totals.Chunks),
+			formatInt(totals.Edges),
+			formatInt(totals.Embeddings),
+		)
 		_ = tw.Flush()
-	}
-
-	out.WriteString("\nTotals\n")
-	out.WriteString(fmt.Sprintf("  files=%s  symbols=%s  occurrences=%s  chunks=%s  edges=%s  embeddings=%s\n",
-		formatInt(totals.Files),
-		formatInt(totals.Symbols),
-		formatInt(totals.Occurrences),
-		formatInt(totals.Chunks),
-		formatInt(totals.Edges),
-		formatInt(totals.Embeddings),
-	))
-
-	if stats != nil {
-		out.WriteString("\n")
-		out.WriteString(formatEmbedStats(*stats))
 	}
 
 	return strings.TrimRight(out.String(), "\n")
