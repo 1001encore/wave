@@ -85,21 +85,17 @@ type indexerInstallSpec struct {
 }
 
 const (
-	autoReindexMinChangedFiles  = 30
-	autoReindexMinChangedRatio  = 0.22
-	autoReindexMissingFileFloor = 10
-	warnMinChangedFiles         = (autoReindexMinChangedFiles * 2) / 3
-	warnMinChangedRatio         = autoReindexMinChangedRatio * (2.0 / 3.0)
-	warnMissingFileFloor        = (autoReindexMissingFileFloor*2 + 2) / 3
-	defaultResultLimit          = 10
-	defaultDefLimit             = 3
-	defaultRefsLimit            = 3
-	defaultAdaptiveClipMinKeep  = 3
-	adaptiveClipSoftmaxFloor    = 0.85
-	adaptiveClipNextProbCeiling = 0.05
-	releaseRepoOwner            = "1001encore"
-	releaseRepoName             = "wave"
-	defaultVersion              = "dev"
+	autoReindexMinChangedLineRatio = 0.22
+	warnMinChangedLineRatio        = autoReindexMinChangedLineRatio * (2.0 / 3.0)
+	defaultResultLimit             = 10
+	defaultDefLimit                = 3
+	defaultRefsLimit               = 3
+	defaultAdaptiveClipMinKeep     = 3
+	adaptiveClipSoftmaxFloor       = 0.85
+	adaptiveClipNextProbCeiling    = 0.05
+	releaseRepoOwner               = "1001encore"
+	releaseRepoName                = "wave"
+	defaultVersion                 = "dev"
 )
 
 var version = defaultVersion
@@ -272,7 +268,7 @@ func runStatus(ctx context.Context, args []string) int {
 	for _, view := range views {
 		fmt.Fprintf(
 			tw,
-			"%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s (%d changed: dirty=%d new=%d missing=%d, %.1f%%)\n",
+			"%s\t%s\t%s\t%s\t%d\t%d\t%d\t%d\t%s (%d/%d LOC %.1f%%)\n",
 			view.root,
 			view.language,
 			view.adapter,
@@ -282,11 +278,9 @@ func runStatus(ctx context.Context, args []string) int {
 			view.chunks,
 			view.edges,
 			view.freshness.Status,
-			view.freshness.ChangedFiles,
-			view.freshness.DirtyFiles,
-			view.freshness.NewFiles,
-			view.freshness.MissingFiles,
-			view.freshness.ChangedRatio*100,
+			view.freshness.ChangedLines,
+			view.freshness.TotalLines,
+			view.freshness.LineRatio*100,
 		)
 	}
 	_ = tw.Flush()
@@ -1334,14 +1328,12 @@ func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
 			if !cc.jsonOut {
 				fmt.Fprintf(
 					os.Stderr,
-					"info: %s (%s); auto re-indexing (changed=%d/%d, dirty=%d new=%d missing=%d)\n",
+					"info: %s (%s); auto re-indexing (changed_loc=%d/%d %.1f%%)\n",
 					reason,
 					item.Unit.Language,
-					freshness.ChangedFiles,
-					max(freshness.IndexedFiles, freshness.CurrentFiles),
-					freshness.DirtyFiles,
-					freshness.NewFiles,
-					freshness.MissingFiles,
+					freshness.ChangedLines,
+					freshness.TotalLines,
+					freshness.LineRatio*100,
 				)
 			}
 			_, _, indexErr := performIndex(ctx, cc)
@@ -1367,11 +1359,8 @@ func shouldAutoReindex(freshness indexer.Freshness) (bool, string) {
 	if !freshness.Dirty {
 		return false, ""
 	}
-	if freshness.ChangedFiles >= autoReindexMinChangedFiles && freshness.ChangedRatio >= autoReindexMinChangedRatio {
-		return true, fmt.Sprintf("index is stale after a large refactor (>= %d files and >= %.0f%% changed)", autoReindexMinChangedFiles, autoReindexMinChangedRatio*100)
-	}
-	if freshness.MissingFiles >= autoReindexMissingFileFloor {
-		return true, fmt.Sprintf("index is stale with many moved/deleted files (>= %d missing)", autoReindexMissingFileFloor)
+	if freshness.LineRatio >= autoReindexMinChangedLineRatio {
+		return true, fmt.Sprintf("index is stale after a large refactor (>= %.0f%% changed LOC)", autoReindexMinChangedLineRatio*100)
 	}
 	return false, ""
 }
@@ -1383,10 +1372,7 @@ func shouldShowFreshnessWarning(freshness indexer.Freshness) bool {
 	if ok, _ := shouldAutoReindex(freshness); ok {
 		return true
 	}
-	if freshness.ChangedFiles >= warnMinChangedFiles && freshness.ChangedRatio >= warnMinChangedRatio {
-		return true
-	}
-	if freshness.MissingFiles >= warnMissingFileFloor {
+	if freshness.LineRatio >= warnMinChangedLineRatio {
 		return true
 	}
 	return false
@@ -1429,6 +1415,7 @@ func buildPayload(
 			AbsPath:      absPath,
 			Language:     firstNonEmpty(unit.Language, doc.GetLanguage()),
 			ContentHash:  sha256Hex(content),
+			LineCount:    countContentLines(content),
 		}
 		fileSources[relativePath] = content
 
@@ -2229,6 +2216,22 @@ func sha256Hex(content []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func countContentLines(content []byte) int {
+	if len(content) == 0 {
+		return 0
+	}
+	lines := 0
+	for _, b := range content {
+		if b == '\n' {
+			lines++
+		}
+	}
+	if content[len(content)-1] != '\n' {
+		lines++
+	}
+	return lines
+}
+
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -2391,13 +2394,13 @@ func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax 
 	}
 	for i, hit := range hits {
 		item := searchHitOutput{
-			Path:            hit.Path,
-			StartLine:       hit.StartLine,
-			EndLine:         hit.EndLine,
-			Kind:            hit.Kind,
-			Name:            hit.Name,
-			HeaderText:      hit.HeaderText,
-			Text:            hit.Text,
+			Path:       hit.Path,
+			StartLine:  hit.StartLine,
+			EndLine:    hit.EndLine,
+			Kind:       hit.Kind,
+			Name:       hit.Name,
+			HeaderText: hit.HeaderText,
+			Text:       hit.Text,
 		}
 		if includeScore {
 			score := hit.Score
@@ -2542,12 +2545,12 @@ func printFreshnessWarning(ctx context.Context, st *store.Store, units []indexer
 		}
 		fmt.Fprintf(
 			os.Stderr,
-			"warning: %s index is %s; dirty=%d new=%d missing=%d\n",
+			"warning: %s index is %s; changed_loc=%d/%d (%.1f%%)\n",
 			item.Unit.Language,
 			freshness.Status,
-			freshness.DirtyFiles,
-			freshness.NewFiles,
-			freshness.MissingFiles,
+			freshness.ChangedLines,
+			freshness.TotalLines,
+			freshness.LineRatio*100,
 		)
 	}
 }

@@ -5,8 +5,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+type DiffSummary struct {
+	ChangedPaths []string
+	ChangedLines int
+	Stats        []DiffStat
+}
+
+type DiffStat struct {
+	Path    string
+	Added   int
+	Deleted int
+}
 
 // IsGitRepo returns true if root (or an ancestor) contains a .git directory.
 func IsGitRepo(root string) bool {
@@ -81,6 +94,133 @@ func ListFiles(root string, extensions []string) ([]string, error) {
 	}
 	sort.Strings(files)
 	return files, nil
+}
+
+// UntrackedFiles returns sorted relative paths for untracked files that are
+// not ignored by git.
+func UntrackedFiles(root string) ([]string, error) {
+	cmd := exec.Command("git", "ls-files", "--others", "--exclude-standard")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	raw := strings.TrimSpace(string(out))
+	if raw == "" {
+		return nil, nil
+	}
+	lines := strings.Split(raw, "\n")
+	files := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		files = append(files, filepath.ToSlash(line))
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// DiffSummarySince returns changed paths and total changed lines between the
+// given commit-ish reference and the current working tree. It includes staged
+// and unstaged tracked changes; untracked files are excluded.
+func DiffSummarySince(root string, fromRef string) (DiffSummary, error) {
+	nameStatusCmd := exec.Command("git", "-c", "core.quotepath=false", "diff", "--name-status", "--find-renames", fromRef)
+	nameStatusCmd.Dir = root
+	nameStatusOut, err := nameStatusCmd.Output()
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	pathSet := map[string]struct{}{}
+	nameStatusRaw := strings.TrimSpace(string(nameStatusOut))
+	if nameStatusRaw != "" {
+		for _, line := range strings.Split(nameStatusRaw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) < 2 {
+				continue
+			}
+			status := strings.TrimSpace(parts[0])
+			if status == "" {
+				continue
+			}
+			code := status[0]
+			switch code {
+			case 'R', 'C':
+				if len(parts) >= 3 {
+					pathSet[filepath.ToSlash(strings.TrimSpace(parts[1]))] = struct{}{}
+					pathSet[filepath.ToSlash(strings.TrimSpace(parts[2]))] = struct{}{}
+				}
+			default:
+				pathSet[filepath.ToSlash(strings.TrimSpace(parts[1]))] = struct{}{}
+			}
+		}
+	}
+
+	changedPaths := make([]string, 0, len(pathSet))
+	for path := range pathSet {
+		if path == "" {
+			continue
+		}
+		changedPaths = append(changedPaths, path)
+	}
+	sort.Strings(changedPaths)
+
+	numstatCmd := exec.Command("git", "-c", "core.quotepath=false", "diff", "--numstat", "--find-renames", fromRef)
+	numstatCmd.Dir = root
+	numstatOut, err := numstatCmd.Output()
+	if err != nil {
+		return DiffSummary{}, err
+	}
+
+	changedLines := 0
+	stats := make([]DiffStat, 0)
+	numstatRaw := strings.TrimSpace(string(numstatOut))
+	if numstatRaw != "" {
+		for _, line := range strings.Split(numstatRaw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue
+			}
+			parts := strings.SplitN(line, "\t", 3)
+			if len(parts) < 2 {
+				continue
+			}
+			added := 0
+			deleted := 0
+			if parts[0] != "-" {
+				if parsed, parseErr := strconv.Atoi(parts[0]); parseErr == nil {
+					added = parsed
+				}
+			}
+			if parts[1] != "-" {
+				if parsed, parseErr := strconv.Atoi(parts[1]); parseErr == nil {
+					deleted = parsed
+				}
+			}
+			changedLines += added + deleted
+			path := ""
+			if len(parts) == 3 {
+				path = filepath.ToSlash(strings.TrimSpace(parts[2]))
+			}
+			stats = append(stats, DiffStat{
+				Path:    path,
+				Added:   added,
+				Deleted: deleted,
+			})
+		}
+	}
+
+	return DiffSummary{
+		ChangedPaths: changedPaths,
+		ChangedLines: changedLines,
+		Stats:        stats,
+	}, nil
 }
 
 // WalkFiles returns sorted relative paths of files under root whose extension

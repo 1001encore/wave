@@ -229,55 +229,38 @@ func TestModeNeedsSemanticEmbedding(t *testing.T) {
 }
 
 func TestShouldAutoReindexThresholds(t *testing.T) {
-	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedFiles: 24, ChangedRatio: 0.18}); ok {
-		t.Fatal("expected previous threshold (24 files, 18%) to no longer auto re-index")
+	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedLines: 240, TotalLines: 1000, LineRatio: 0.18}); ok {
+		t.Fatal("expected 18% changed LOC to stay below auto re-index threshold")
 	}
-	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedFiles: 30, ChangedRatio: 0.22}); !ok {
-		t.Fatal("expected updated threshold (30 files, 22%) to auto re-index")
-	}
-	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, MissingFiles: 10}); !ok {
-		t.Fatal("expected missing-file floor to auto re-index")
+	if ok, _ := shouldAutoReindex(indexer.Freshness{Dirty: true, ChangedLines: 220, TotalLines: 1000, LineRatio: 0.22}); !ok {
+		t.Fatal("expected 22% changed LOC to auto re-index")
 	}
 }
 
 func TestShouldShowFreshnessWarningThresholds(t *testing.T) {
 	if shouldShowFreshnessWarning(indexer.Freshness{
 		Dirty:        true,
-		DirtyFiles:   1,
-		ChangedFiles: 1,
-		ChangedRatio: 0.02,
+		ChangedLines: 20,
+		TotalLines:   1000,
+		LineRatio:    0.02,
 	}) {
 		t.Fatal("expected tiny staleness to suppress warning")
 	}
 	if shouldShowFreshnessWarning(indexer.Freshness{
 		Dirty:        true,
-		DirtyFiles:   19,
-		ChangedFiles: 19,
-		ChangedRatio: 0.20,
+		ChangedLines: 140,
+		TotalLines:   1000,
+		LineRatio:    0.14,
 	}) {
-		t.Fatal("expected warning to stay suppressed below the 2/3 changed-files threshold")
+		t.Fatal("expected warning to stay suppressed below the changed-LOC warning threshold")
 	}
 	if !shouldShowFreshnessWarning(indexer.Freshness{
 		Dirty:        true,
-		DirtyFiles:   20,
-		ChangedFiles: 20,
-		ChangedRatio: 0.15,
+		ChangedLines: 150,
+		TotalLines:   1000,
+		LineRatio:    0.15,
 	}) {
-		t.Fatal("expected moderate staleness to show warning")
-	}
-	if shouldShowFreshnessWarning(indexer.Freshness{
-		Dirty:        true,
-		MissingFiles: 6,
-		ChangedFiles: 6,
-	}) {
-		t.Fatal("expected warning to stay suppressed below the 2/3 missing-files threshold")
-	}
-	if !shouldShowFreshnessWarning(indexer.Freshness{
-		Dirty:        true,
-		MissingFiles: 7,
-		ChangedFiles: 7,
-	}) {
-		t.Fatal("expected missing-file threshold to show warning")
+		t.Fatal("expected moderate changed-LOC staleness to show warning")
 	}
 }
 

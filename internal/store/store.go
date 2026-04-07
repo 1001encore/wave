@@ -42,6 +42,7 @@ type FileData struct {
 	AbsPath      string
 	Language     string
 	ContentHash  string
+	LineCount    int
 }
 
 type SymbolData struct {
@@ -146,6 +147,7 @@ type IndexedFileRow struct {
 	RelativePath string
 	AbsPath      string
 	ContentHash  string
+	LineCount    int
 }
 
 type RelatedChunk struct {
@@ -267,14 +269,15 @@ func (s *Store) migrate() error {
 				UNIQUE(root_path, adapter_id)
 			);`,
 		`CREATE TABLE IF NOT EXISTS files (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
-			relative_path TEXT NOT NULL,
-			abs_path TEXT NOT NULL,
-			language TEXT NOT NULL,
-			content_hash TEXT NOT NULL,
-			UNIQUE(project_id, relative_path)
-		);`,
+				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				relative_path TEXT NOT NULL,
+				abs_path TEXT NOT NULL,
+				language TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				line_count INTEGER NOT NULL DEFAULT 0,
+				UNIQUE(project_id, relative_path)
+			);`,
 		`CREATE TABLE IF NOT EXISTS symbols (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -387,6 +390,9 @@ func (s *Store) migrate() error {
 	}
 	if _, err := s.db.Exec(`ALTER TABLE projects ADD COLUMN git_commit_hash TEXT NOT NULL DEFAULT ''`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
 		return fmt.Errorf("migrate git_commit_hash column: %w", err)
+	}
+	if _, err := s.db.Exec(`ALTER TABLE files ADD COLUMN line_count INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		return fmt.Errorf("migrate line_count column: %w", err)
 	}
 	if err := s.migrateLegacyProjectUniqueness(); err != nil {
 		return err
@@ -539,13 +545,14 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	for _, file := range payload.Files {
 		res, execErr := tx.ExecContext(
 			ctx,
-			`INSERT INTO files (project_id, relative_path, abs_path, language, content_hash)
-			 VALUES (?, ?, ?, ?, ?)`,
+			`INSERT INTO files (project_id, relative_path, abs_path, language, content_hash, line_count)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
 			projectID,
 			file.RelativePath,
 			file.AbsPath,
 			file.Language,
 			file.ContentHash,
+			file.LineCount,
 		)
 		if execErr != nil {
 			return fmt.Errorf("insert file %s: %w", file.RelativePath, execErr)
@@ -933,7 +940,7 @@ func (s *Store) IndexedFiles(ctx context.Context, rootPath string, adapterID str
 		return nil, err
 	}
 
-	query := `SELECT f.relative_path, f.abs_path, f.content_hash
+	query := `SELECT f.relative_path, f.abs_path, f.content_hash, f.line_count
 		FROM files f
 		JOIN projects p ON p.id = f.project_id
 		WHERE p.root_path = ?`
@@ -952,7 +959,7 @@ func (s *Store) IndexedFiles(ctx context.Context, rootPath string, adapterID str
 	result := map[string]IndexedFileRow{}
 	for rows.Next() {
 		var row IndexedFileRow
-		if err := rows.Scan(&row.RelativePath, &row.AbsPath, &row.ContentHash); err != nil {
+		if err := rows.Scan(&row.RelativePath, &row.AbsPath, &row.ContentHash, &row.LineCount); err != nil {
 			return nil, fmt.Errorf("scan indexed file: %w", err)
 		}
 		result[row.RelativePath] = row
