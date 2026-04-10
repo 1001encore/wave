@@ -39,13 +39,16 @@ import (
 )
 
 type commandContext struct {
-	rootPath string
-	dbPath   string
-	jsonOut  bool
-	limit    int
-	explain  bool
-	mode     string
-	device   string
+	rootPath      string
+	dbPath        string
+	jsonOut       bool
+	limit         int
+	explain       bool
+	mode          string
+	device        string
+	showPreview   bool
+	previewChars  int
+	showSignature bool
 }
 
 type defOccurrence struct {
@@ -292,6 +295,9 @@ func runSearch(ctx context.Context, args []string) int {
 	cc := bindCommonFlags(fs)
 	var showScore bool
 	var showSoftmax bool
+	fs.BoolVar(&cc.showPreview, "preview", false, "show a code preview line")
+	fs.IntVar(&cc.previewChars, "preview-chars", 120, "maximum preview length in characters")
+	fs.BoolVar(&cc.showSignature, "signature", false, "show SCIP signature")
 	fs.BoolVar(&showScore, "show-score", false, "include raw rerank scores in output")
 	fs.BoolVar(&showSoftmax, "show-softmax", false, "include softmax probabilities over returned hits (relative within this result set)")
 	if err := fs.Parse(args); err != nil {
@@ -357,11 +363,8 @@ func runSearch(ctx context.Context, args []string) int {
 	}
 	for i, hit := range result.Hits {
 		displayPath := formatSearchDisplayPath(rootPath, hit.Path)
-		kind := strings.ToLower(prettifySearchKind(hit.Kind))
-		summary := firstNonEmpty(hit.Name, hit.HeaderText)
-		if summary == "" {
-			summary = "(anonymous)"
-		}
+		kind := prettifySearchKind(hit.Kind)
+		summary := firstNonEmpty(hit.DisplayName, hit.Name, "(anonymous)")
 		if showScore || showSoftmax {
 			parts := make([]string, 0, 2)
 			if showScore {
@@ -373,17 +376,36 @@ func runSearch(ctx context.Context, args []string) int {
 			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
 		}
 		fmt.Printf(
-			"%d. %s (%s) at %s:%d-%d\n",
+			"%d. %s at %s:%d-%d [%s]\n",
 			i+1,
 			summary,
-			kind,
 			displayPath,
 			hit.StartLine+1,
 			hit.EndLine+1,
+			kind,
 		)
-		snippet := searchCodePreview(hit.HeaderText, 200)
-		if snippet != "" {
-			fmt.Printf("   Code: %s\n", snippet)
+		if cc.showSignature {
+			if signature := strings.TrimSpace(hit.Signature); signature != "" {
+				fmt.Printf("   Signature: %s\n", signature)
+			}
+		}
+		if cc.showPreview {
+			snippet := searchCodePreview(firstNonEmpty(hit.HeaderText, hit.Text), cc.previewChars)
+			if snippet != "" {
+				fmt.Printf("   Preview: %s\n", snippet)
+			}
+		}
+	}
+	if cc.showSignature {
+		hasAnySig := false
+		for _, hit := range result.Hits {
+			if strings.TrimSpace(hit.Signature) != "" {
+				hasAnySig = true
+				break
+			}
+		}
+		if !hasAnySig {
+			fmt.Fprintf(os.Stderr, "warning: --signature was requested but no results contained signature data; the SCIP indexer for this project may not emit signatures\n")
 		}
 	}
 	return 0
@@ -791,10 +813,24 @@ func bindCommonFlagsWithLimitAndDevice(fs *flag.FlagSet, defaultLimit int, defau
 }
 
 func detectWorkspaceUnits(start string) (string, []indexer.DetectedUnit, error) {
-	detected, err := indexer.DetectUnits(adapters(), start)
+	allAdapters := adapters()
+
+	// First try recursive downward detection: this finds nested workspaces
+	// inside monorepos (e.g. services/api/go.mod, services/web/package.json).
+	if allUnits, err := indexer.DetectAllUnits(allAdapters, start); err == nil && len(allUnits) > 0 {
+		absStart, _ := filepath.Abs(start)
+		return absStart, allUnits, nil
+	}
+
+	// Fall back to upward detection from the starting directory.
+	detected, err := indexer.DetectUnits(allAdapters, start)
 	if err != nil {
 		return "", nil, err
 	}
+	return selectBestRoot(detected, start)
+}
+
+func selectBestRoot(detected []indexer.DetectedUnit, start string) (string, []indexer.DetectedUnit, error) {
 	if len(detected) == 0 {
 		return "", nil, fmt.Errorf("no supported workspace unit found from %s", start)
 	}
@@ -1133,6 +1169,14 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 		return nil, "", err
 	}
 	defer st.Close()
+
+	if created, err := vcs.EnsureWaveignore(rootPath); err != nil {
+		if !cc.jsonOut {
+			fmt.Fprintf(os.Stderr, "warning: could not create default .waveignore: %v\n", err)
+		}
+	} else if created && !cc.jsonOut {
+		fmt.Fprintf(os.Stderr, "info: created default .waveignore in %s\n", rootPath)
+	}
 
 	if err := ensureIndexerDependencies(ctx, units, cc.jsonOut); err != nil {
 		return nil, "", err
@@ -2268,7 +2312,10 @@ func formatSearchDisplayPath(rootPath string, hitPath string) string {
 }
 
 func prettifySearchKind(kind string) string {
-	kind = strings.TrimSpace(strings.ReplaceAll(kind, "_", " "))
+	kind = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(kind, "_", " ")))
+	kind = strings.TrimSuffix(kind, " declaration")
+	kind = strings.TrimSuffix(kind, " definition")
+	kind = strings.TrimSuffix(kind, " item")
 	if kind == "" {
 		return "Result"
 	}
@@ -2290,10 +2337,16 @@ func searchCodePreview(headerText string, maxChars int) string {
 	if line == "" {
 		return ""
 	}
-	if len(line) > maxChars {
-		line = line[:maxChars]
+	if idx := strings.IndexByte(line, '{'); idx >= 0 {
+		line = strings.TrimSpace(strings.TrimSuffix(line[:idx], ";"))
 	}
-	return line + "..."
+	if line == "" {
+		return ""
+	}
+	if len(line) > maxChars {
+		line = strings.TrimSpace(line[:maxChars]) + "..."
+	}
+	return line
 }
 
 func modeNeedsSemanticEmbedding(mode string) bool {
@@ -2364,6 +2417,8 @@ type searchHitOutput struct {
 	EndLine            int      `json:"end_line"`
 	Kind               string   `json:"kind"`
 	Name               string   `json:"name"`
+	DisplayName        string   `json:"display_name"`
+	Signature          string   `json:"signature"`
 	HeaderText         string   `json:"header_text"`
 	Text               string   `json:"text"`
 	Score              *float64 `json:"score,omitempty"`
@@ -2394,13 +2449,15 @@ func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax 
 	}
 	for i, hit := range hits {
 		item := searchHitOutput{
-			Path:       hit.Path,
-			StartLine:  hit.StartLine,
-			EndLine:    hit.EndLine,
-			Kind:       hit.Kind,
-			Name:       hit.Name,
-			HeaderText: hit.HeaderText,
-			Text:       hit.Text,
+			Path:        hit.Path,
+			StartLine:   hit.StartLine,
+			EndLine:     hit.EndLine,
+			Kind:        hit.Kind,
+			Name:        hit.Name,
+			DisplayName: hit.DisplayName,
+			Signature:   hit.Signature,
+			HeaderText:  hit.HeaderText,
+			Text:        hit.Text,
 		}
 		if includeScore {
 			score := hit.Score

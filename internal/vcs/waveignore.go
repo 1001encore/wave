@@ -2,6 +2,7 @@ package vcs
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,6 +91,68 @@ func isIgnored(relPath string, rules []ignoreRule) bool {
 		}
 	}
 	return false
+}
+
+// DefaultWaveignoreContent returns sensible default ignore patterns for common
+// project setups, similar to a standard .gitignore template.
+func DefaultWaveignoreContent() string {
+	return `# Build outputs
+build/
+dist/
+out/
+target/
+
+# Dependencies
+node_modules/
+vendor/
+.venv/
+__pycache__/
+
+# Generated / minified
+*.min.js
+*.min.css
+*.map
+*.generated.go
+*.pb.go
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+coverage/
+.nyc_output/
+`
+}
+
+// EnsureWaveignore creates a default .waveignore in root if one does not already
+// exist. Returns true if a new file was created.
+func EnsureWaveignore(root string) (bool, error) {
+	path := filepath.Join(root, waveignoreFile)
+	if _, err := os.Stat(path); err == nil {
+		return false, nil
+	}
+	if err := os.WriteFile(path, []byte(DefaultWaveignoreContent()), 0o644); err != nil {
+		return false, fmt.Errorf("create default %s: %w", waveignoreFile, err)
+	}
+	return true, nil
+}
+
+// IsPathIgnored checks whether relPath (forward-slash separated, relative to
+// root) is ignored by the .waveignore file in root. Returns false when no
+// .waveignore exists.
+func IsPathIgnored(root string, relPath string) bool {
+	rules := loadWaveignore(root)
+	if len(rules) == 0 {
+		return false
+	}
+	return isIgnored(relPath, rules)
 }
 
 // filterIgnored removes paths that match any waveignore rule.

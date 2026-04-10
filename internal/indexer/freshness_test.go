@@ -41,6 +41,7 @@ func (f freshnessTestAdapter) DeriveEdges(context.Context, DeriveRequest) ([]sto
 	return nil, nil
 }
 func (f freshnessTestAdapter) NormalizeDisplayName(value string) string { return value }
+func (f freshnessTestAdapter) Manifests() []string                      { return nil }
 
 func TestComputeFreshnessGitDiffUsesRealCounts(t *testing.T) {
 	ctx := context.Background()

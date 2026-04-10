@@ -3,6 +3,8 @@ package indexer
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/1001encore/wave/internal/store"
@@ -38,6 +40,7 @@ func (f fakeAdapter) DeriveEdges(context.Context, DeriveRequest) ([]store.EdgeDa
 	return nil, nil
 }
 func (f fakeAdapter) NormalizeDisplayName(value string) string { return value }
+func (f fakeAdapter) Manifests() []string                      { return nil }
 
 func TestDetectUnitsReturnsAllMatchesInOrder(t *testing.T) {
 	adapters := []Adapter{
@@ -113,5 +116,95 @@ func TestDetectUnitsFailsWhenNoAdapterMatches(t *testing.T) {
 
 	if _, err := DetectUnits(adapters, "/repo"); err == nil {
 		t.Fatal("expected detect error")
+	}
+}
+
+// manifestAdapter is a fakeAdapter that also reports manifest filenames,
+// enabling DetectAllUnits to discover it during tree walks.
+type manifestAdapter struct {
+	fakeAdapter
+	manifests []string
+}
+
+func (m manifestAdapter) Manifests() []string { return m.manifests }
+
+func TestDetectAllUnitsFindsNestedWorkspaces(t *testing.T) {
+	root := t.TempDir()
+
+	// Create monorepo structure:
+	//   root/services/api/go.mod
+	//   root/services/web/package.json
+	//   root/services/web/tsconfig.json
+	apiDir := filepath.Join(root, "services", "api")
+	webDir := filepath.Join(root, "services", "web")
+	if err := os.MkdirAll(apiDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(webDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(apiDir, "go.mod"), []byte("module api"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "package.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(webDir, "tsconfig.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	adapters := []Adapter{
+		manifestAdapter{
+			fakeAdapter: fakeAdapter{id: "go-scip", language: "go"},
+			manifests:   []string{"go.mod"},
+		},
+		manifestAdapter{
+			fakeAdapter: fakeAdapter{id: "typescript-scip", language: "typescript"},
+			manifests:   []string{"tsconfig.json"},
+		},
+	}
+
+	units, err := DetectAllUnits(adapters, root)
+	if err != nil {
+		t.Fatalf("DetectAllUnits() error = %v", err)
+	}
+	if len(units) != 2 {
+		t.Fatalf("unit count = %d, want 2", len(units))
+	}
+
+	ids := map[string]bool{}
+	for _, u := range units {
+		ids[u.Adapter.ID()] = true
+	}
+	if !ids["go-scip"] {
+		t.Error("expected go-scip unit")
+	}
+	if !ids["typescript-scip"] {
+		t.Error("expected typescript-scip unit")
+	}
+}
+
+func TestDetectAllUnitsSkipsNodeModules(t *testing.T) {
+	root := t.TempDir()
+
+	// Create a tsconfig.json inside node_modules — should be skipped
+	nmDir := filepath.Join(root, "node_modules", "somepkg")
+	if err := os.MkdirAll(nmDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nmDir, "tsconfig.json"), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	adapters := []Adapter{
+		manifestAdapter{
+			fakeAdapter: fakeAdapter{id: "typescript-scip", language: "typescript"},
+			manifests:   []string{"tsconfig.json"},
+		},
+	}
+
+	_, err := DetectAllUnits(adapters, root)
+	if err == nil {
+		t.Fatal("expected error for empty results, got nil")
 	}
 }

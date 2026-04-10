@@ -24,6 +24,7 @@ const (
 
 func (Adapter) ID() string       { return adapterID }
 func (Adapter) Language() string { return language }
+func (Adapter) Manifests() []string { return []string{"go.mod"} }
 
 func (Adapter) Detect(start string) (workspace.Unit, error) {
 	absStart, err := filepath.Abs(start)

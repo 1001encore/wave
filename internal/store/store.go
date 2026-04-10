@@ -161,6 +161,8 @@ type RelatedChunk struct {
 	EndLine      int     `json:"end_line"`
 	Kind         string  `json:"kind"`
 	Name         string  `json:"name"`
+	DisplayName  string  `json:"display_name"`
+	Signature    string  `json:"signature"`
 	HeaderText   string  `json:"header_text"`
 	Text         string  `json:"text"`
 	Score        float64 `json:"score"`
@@ -182,6 +184,8 @@ type SearchHit struct {
 	EndLine            int     `json:"end_line"`
 	Kind               string  `json:"kind"`
 	Name               string  `json:"name"`
+	DisplayName        string  `json:"display_name"`
+	Signature          string  `json:"signature"`
 	HeaderText         string  `json:"header_text"`
 	Text               string  `json:"text"`
 	Score              float64 `json:"score"`
@@ -1013,11 +1017,14 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 			c.end_line,
 			c.kind,
 			c.name,
+			COALESCE(s.display_name, ''),
+			COALESCE(s.signature, ''),
 			c.header_text,
 			c.text,
 			(%s) AS score
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
+		LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 		WHERE %s
 		ORDER BY score DESC, c.start_line
 		LIMIT ?`, scoreExpr.String(), where.String()),
@@ -1040,6 +1047,8 @@ func (s *Store) SearchChunks(ctx context.Context, rootPath string, query string,
 			&hit.EndLine,
 			&hit.Kind,
 			&hit.Name,
+			&hit.DisplayName,
+			&hit.Signature,
 			&hit.HeaderText,
 			&hit.Text,
 			&hit.Score,
@@ -1082,12 +1091,15 @@ func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vecto
 			c.end_line,
 			c.kind,
 			c.name,
+			COALESCE(s.display_name, ''),
+			COALESCE(s.signature, ''),
 			c.header_text,
 			c.text,
 			knn.distance
 		FROM knn
 		JOIN chunks c ON c.id = knn.chunk_id
 		JOIN files f ON f.id = c.file_id
+		LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 		ORDER BY knn.distance, c.start_line
 		LIMIT ?`,
@@ -1113,6 +1125,8 @@ func (s *Store) SemanticSearchChunks(ctx context.Context, rootPath string, vecto
 			&hit.EndLine,
 			&hit.Kind,
 			&hit.Name,
+			&hit.DisplayName,
+			&hit.Signature,
 			&hit.HeaderText,
 			&hit.Text,
 			&hit.Score,
@@ -1492,9 +1506,10 @@ func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID i
 		ctx,
 		`SELECT
 			c.id, c.file_id, COALESCE(c.primary_symbol_id, 0), f.abs_path,
-			c.start_line, c.end_line, c.kind, c.name, c.header_text, c.text, 0.0
+			c.start_line, c.end_line, c.kind, c.name, COALESCE(s.display_name, ''), COALESCE(s.signature, ''), c.header_text, c.text, 0.0
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
+		LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND c.primary_symbol_id = ?
 		ORDER BY c.start_line
 		LIMIT 1`,
@@ -1512,6 +1527,8 @@ func (s *Store) DefinitionChunk(ctx context.Context, rootPath string, symbolID i
 		&hit.EndLine,
 		&hit.Kind,
 		&hit.Name,
+		&hit.DisplayName,
+		&hit.Signature,
 		&hit.HeaderText,
 		&hit.Text,
 		&hit.Score,
@@ -1575,9 +1592,10 @@ func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int6
 		ctx,
 		`SELECT
 			c.id, c.file_id, COALESCE(c.primary_symbol_id, 0), f.abs_path,
-			c.start_line, c.end_line, c.kind, c.name, c.header_text, c.text, 0.0
+			c.start_line, c.end_line, c.kind, c.name, COALESCE(s.display_name, ''), COALESCE(s.signature, ''), c.header_text, c.text, 0.0
 		FROM chunks c
 		JOIN files f ON f.id = c.file_id
+		LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 		WHERE c.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND c.file_id = ? AND c.id != ?
 		ORDER BY ABS(c.start_line - (
 			SELECT start_line FROM chunks WHERE id = ?
@@ -1606,6 +1624,8 @@ func (s *Store) NeighborChunks(ctx context.Context, rootPath string, fileID int6
 			&hit.EndLine,
 			&hit.Kind,
 			&hit.Name,
+			&hit.DisplayName,
+			&hit.Signature,
 			&hit.HeaderText,
 			&hit.Text,
 			&hit.Score,
@@ -1625,7 +1645,7 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 
 	rows, err := s.db.QueryContext(
 		ctx,
-		`SELECT relation_kind, direction, chunk_id, file_id, symbol_id, path, start_line, end_line, kind, name, header_text, text, score
+		`SELECT relation_kind, direction, chunk_id, file_id, symbol_id, path, start_line, end_line, kind, name, COALESCE(display_name, ''), COALESCE(signature, ''), header_text, text, score
 		FROM (
 			SELECT
 				e.kind AS relation_kind,
@@ -1638,12 +1658,15 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 				c.end_line AS end_line,
 				c.kind AS kind,
 				c.name AS name,
+				s.display_name AS display_name,
+				s.signature AS signature,
 				c.header_text AS header_text,
 				c.text AS text,
 				0.0 AS score
 			FROM edges e
 			JOIN chunks c ON c.primary_symbol_id = e.dst_symbol_id
 			JOIN files f ON f.id = c.file_id
+			LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.src_symbol_id = ? AND c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 			UNION ALL
 			SELECT
@@ -1657,12 +1680,15 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 				c.end_line AS end_line,
 				c.kind AS kind,
 				c.name AS name,
+				s.display_name AS display_name,
+				s.signature AS signature,
 				c.header_text AS header_text,
 				c.text AS text,
 				0.0 AS score
 			FROM edges e
 			JOIN chunks c ON c.primary_symbol_id = e.src_symbol_id
 			JOIN files f ON f.id = c.file_id
+			LEFT JOIN symbols s ON s.id = c.primary_symbol_id
 			WHERE e.project_id IN (SELECT id FROM projects WHERE root_path = ?) AND e.dst_symbol_id = ? AND c.project_id IN (SELECT id FROM projects WHERE root_path = ?)
 		)
 		ORDER BY relation_kind, direction, path, start_line
@@ -1691,6 +1717,8 @@ func (s *Store) RelatedChunks(ctx context.Context, rootPath string, symbolID int
 			&item.EndLine,
 			&item.Kind,
 			&item.Name,
+			&item.DisplayName,
+			&item.Signature,
 			&item.HeaderText,
 			&item.Text,
 			&item.Score,

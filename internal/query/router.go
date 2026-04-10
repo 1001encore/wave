@@ -462,6 +462,8 @@ func (r *Router) rankSearchHits(ctx context.Context, rootPath string, query stri
 					EndLine:         rel.EndLine,
 					Kind:            rel.Kind,
 					Name:            rel.Name,
+					DisplayName:     rel.DisplayName,
+					Signature:       rel.Signature,
 					HeaderText:      rel.HeaderText,
 					Text:            rel.Text,
 				}, boost)

@@ -21,6 +21,7 @@ var manifests = []string{"pyproject.toml", "setup.py", "setup.cfg"}
 
 func (Adapter) ID() string       { return "python-scip" }
 func (Adapter) Language() string { return "python" }
+func (Adapter) Manifests() []string { return manifests }
 
 func (Adapter) Detect(start string) (workspace.Unit, error) {
 	absStart, err := filepath.Abs(start)

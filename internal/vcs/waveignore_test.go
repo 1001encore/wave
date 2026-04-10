@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -160,6 +161,33 @@ func TestSourceFilesWaveignoreGlobPattern(t *testing.T) {
 	want := []string{"main.go", "pkg/real.go"}
 	if !reflect.DeepEqual(files, want) {
 		t.Fatalf("files = %v, want %v", files, want)
+	}
+}
+
+func TestEnsureWaveignoreCreatesDefault(t *testing.T) {
+	dir := t.TempDir()
+	created, err := EnsureWaveignore(dir)
+	if err != nil {
+		t.Fatalf("EnsureWaveignore() error = %v", err)
+	}
+	if !created {
+		t.Fatal("expected file to be created")
+	}
+	content, err := os.ReadFile(filepath.Join(dir, ".waveignore"))
+	if err != nil {
+		t.Fatalf("read .waveignore: %v", err)
+	}
+	if !strings.Contains(string(content), "node_modules/") {
+		t.Fatal("expected default content to include node_modules/")
+	}
+
+	// Second call should not recreate
+	created2, err := EnsureWaveignore(dir)
+	if err != nil {
+		t.Fatalf("second EnsureWaveignore() error = %v", err)
+	}
+	if created2 {
+		t.Fatal("expected file to not be recreated")
 	}
 }
 

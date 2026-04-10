@@ -503,6 +503,45 @@ func TestSearchHitsOutputUsesPrecomputedSoftmaxWhenPresent(t *testing.T) {
 	}
 }
 
+func TestSearchHitsOutputIncludesScipMetadata(t *testing.T) {
+	hits := []store.SearchHit{
+		{
+			ChunkID:     1,
+			Name:        "Language",
+			DisplayName: "Language",
+			Signature:   "func (Adapter) Language() string",
+			Score:       1.0,
+		},
+	}
+
+	out := searchHitsOutput(hits, false, false)
+	if len(out) != 1 {
+		t.Fatalf("hit count = %d, want 1", len(out))
+	}
+	if out[0].DisplayName != "Language" {
+		t.Fatalf("display name = %q, want %q", out[0].DisplayName, "Language")
+	}
+	if out[0].Signature != "func (Adapter) Language() string" {
+		t.Fatalf("signature = %q, want %q", out[0].Signature, "func (Adapter) Language() string")
+	}
+}
+
+func TestSearchCodePreviewStripsFunctionBodies(t *testing.T) {
+	got := searchCodePreview("func (Adapter) Language() string { return language }", 320)
+	want := "func (Adapter) Language() string"
+	if got != want {
+		t.Fatalf("searchCodePreview() = %q, want %q", got, want)
+	}
+}
+
+func TestSearchCodePreviewTruncatesToConfiguredLength(t *testing.T) {
+	got := searchCodePreview("abcdefghijklmnopqrstuvwxyz", 10)
+	want := "abcdefghij..."
+	if got != want {
+		t.Fatalf("searchCodePreview() = %q, want %q", got, want)
+	}
+}
+
 func TestShouldApplyDefaultAdaptiveClip(t *testing.T) {
 	if shouldApplyDefaultAdaptiveClip(defaultResultLimit, false) != true {
 		t.Fatal("expected adaptive clip to apply for implicit default limit")

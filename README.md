@@ -77,6 +77,9 @@ wave update --check
 - `--device cpu|cuda` (default: `cpu` for query/status commands, `cuda` for `index`)
 - `wave search --show-score` — include raw rerank score per hit
 - `wave search --show-softmax` — include softmax probability per hit (relative within returned hits)
+- `wave search --preview` — show a short code preview per hit
+- `wave search --preview-chars <n>` — cap preview length in characters
+- `wave search --signature` — show SCIP signature per hit
 
 ## Requirements
 
