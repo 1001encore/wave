@@ -1239,7 +1239,49 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 		if pb != nil {
 			pb.SetDescription(fmt.Sprintf("[%d/%d] building", i+1, len(units)))
 		}
-		payload, err := buildPayload(ctx, unit, adapter, index, indexResult, embedder)
+
+		// Attempt incremental mode: check for existing indexed files.
+		indexedFiles, indexedErr := st.IndexedFiles(ctx, unit.RootPath, adapter.ID())
+		incremental := indexedErr == nil && len(indexedFiles) > 0
+
+		var payload store.IndexPayload
+		var unchangedFiles map[string]struct{}
+
+		if incremental {
+			// Determine which files are unchanged by comparing content hashes.
+			unchangedFiles = make(map[string]struct{})
+			for _, doc := range index.GetDocuments() {
+				relativePath, absPath, ok := resolveDocumentPath(filepath.Clean(unit.RootPath), doc.GetRelativePath())
+				if !ok {
+					continue
+				}
+				if indexed, exists := indexedFiles[relativePath]; exists {
+					content, readErr := os.ReadFile(absPath)
+					if readErr == nil && sha256Hex(content) == indexed.ContentHash {
+						unchangedFiles[relativePath] = struct{}{}
+					}
+				}
+			}
+
+			// Only use incremental if there are actually unchanged files to save work on.
+			if len(unchangedFiles) > 0 {
+				cachedEmbeddings, embErr := st.IndexedChunkEmbeddings(ctx, unit.RootPath, adapter.ID())
+				if embErr != nil {
+					cachedEmbeddings = map[string]store.EmbeddingData{}
+				}
+				cachedChunks, chunkErr := st.IndexedChunks(ctx, unit.RootPath, adapter.ID())
+				if chunkErr != nil {
+					cachedChunks = nil
+				}
+
+				payload, err = buildIncrementalPayload(ctx, unit, adapter, index, indexResult, embedder, unchangedFiles, cachedChunks, cachedEmbeddings)
+			} else {
+				payload, err = buildPayload(ctx, unit, adapter, index, indexResult, embedder)
+				incremental = false
+			}
+		} else {
+			payload, err = buildPayload(ctx, unit, adapter, index, indexResult, embedder)
+		}
 		if err != nil {
 			return nil, "", err
 		}
@@ -1250,8 +1292,14 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 		if pb != nil {
 			pb.SetDescription(fmt.Sprintf("[%d/%d] storing", i+1, len(units)))
 		}
-		if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
-			return nil, "", err
+		if incremental {
+			if err := st.IncrementalUpdateProjectIndex(ctx, payload, unchangedFiles); err != nil {
+				return nil, "", err
+			}
+		} else {
+			if err := st.ReplaceProjectIndex(ctx, payload); err != nil {
+				return nil, "", err
+			}
 		}
 		if pb != nil {
 			pb.Increment()
@@ -1609,6 +1657,260 @@ func buildPayload(
 			Text:      doc.Text,
 			Vector:    vector,
 		})
+	}
+
+	files := mapsToSortedFiles(fileMap)
+	symbols := mapsToSortedSymbols(symbolMap)
+	derivedEdges, err := adapter.DeriveEdges(ctx, indexer.DeriveRequest{
+		Unit:        unit,
+		FileSources: fileSources,
+		Symbols:     symbolMap,
+		Occurrences: occurrences,
+		Chunks:      chunks,
+	})
+	if err != nil {
+		return store.IndexPayload{}, err
+	}
+	edges = append(edges, derivedEdges...)
+
+	gitHash, _ := vcs.HeadCommit(unit.RootPath)
+
+	return store.IndexPayload{
+		Project: store.ProjectData{
+			RootPath:          unit.RootPath,
+			Name:              unit.Name,
+			Language:          unit.Language,
+			ManifestPath:      unit.ManifestPath,
+			EnvironmentSource: unit.EnvironmentSource,
+			AdapterID:         unit.AdapterID,
+			ScipArtifactPath:  indexResult.ArtifactPath,
+			ToolName:          indexResult.ToolName,
+			ToolVersion:       indexResult.ToolVersion,
+			GitCommitHash:     gitHash,
+		},
+		Files:        files,
+		Symbols:      symbols,
+		Occurrences:  occurrences,
+		Chunks:       chunks,
+		ChunkSymbols: chunkSymbols,
+		Edges:        dedupeEdges(edges),
+		Embeddings:   embeddings,
+	}, nil
+}
+
+func buildIncrementalPayload(
+	ctx context.Context,
+	unit workspace.Unit,
+	adapter indexer.Adapter,
+	index *scip.Index,
+	indexResult indexer.Result,
+	embedder embed.Provider,
+	unchangedFiles map[string]struct{},
+	cachedChunks []store.ChunkData,
+	cachedEmbeddings map[string]store.EmbeddingData,
+) (store.IndexPayload, error) {
+	rootPath := filepath.Clean(unit.RootPath)
+	fileMap := map[string]store.FileData{}
+	fileSources := map[string][]byte{}
+	symbolMap := map[string]store.SymbolData{}
+	var occurrences []store.OccurrenceData
+	var chunks []store.ChunkData
+	var edges []store.EdgeData
+	var defs []defOccurrence
+
+	for _, external := range index.GetExternalSymbols() {
+		symbolMap[external.GetSymbol()] = toSymbolData(external, "", adapter.NormalizeDisplayName)
+		edges = append(edges, relationshipEdges(external)...)
+	}
+
+	for _, doc := range index.GetDocuments() {
+		relativePath, absPath, ok := resolveDocumentPath(rootPath, doc.GetRelativePath())
+		if !ok {
+			continue
+		}
+		content, err := os.ReadFile(absPath)
+		if err != nil {
+			return store.IndexPayload{}, fmt.Errorf("read source file %s: %w", absPath, err)
+		}
+
+		fileMap[relativePath] = store.FileData{
+			RelativePath: relativePath,
+			AbsPath:      absPath,
+			Language:     firstNonEmpty(unit.Language, doc.GetLanguage()),
+			ContentHash:  sha256Hex(content),
+			LineCount:    countContentLines(content),
+		}
+		fileSources[relativePath] = content
+
+		// Always process symbols and occurrences (they're cross-file and cheap).
+		for _, info := range doc.GetSymbols() {
+			data := toSymbolData(info, relativePath, adapter.NormalizeDisplayName)
+			symbolMap[data.ScipSymbol] = data
+			edges = append(edges, relationshipEdges(info)...)
+			if data.EnclosingSymbol != "" {
+				edges = append(edges, store.EdgeData{
+					SrcSymbol:  data.EnclosingSymbol,
+					DstSymbol:  data.ScipSymbol,
+					Kind:       "contains",
+					Provenance: "scip",
+				})
+			}
+		}
+
+		for _, occ := range doc.GetOccurrences() {
+			rng, err := scipgraph.ParseRange(occ.GetRange())
+			if err != nil {
+				return store.IndexPayload{}, fmt.Errorf("parse occurrence range for %s: %w", relativePath, err)
+			}
+			enclosing := rng
+			if len(occ.GetEnclosingRange()) > 0 {
+				if parsed, parseErr := scipgraph.ParseRange(occ.GetEnclosingRange()); parseErr == nil {
+					enclosing = parsed
+				}
+			}
+
+			if occ.GetSymbol() != "" {
+				if _, ok := symbolMap[occ.GetSymbol()]; !ok {
+					symbolMap[occ.GetSymbol()] = store.SymbolData{
+						ScipSymbol:  occ.GetSymbol(),
+						DisplayName: adapter.NormalizeDisplayName(occ.GetSymbol()),
+						Kind:        "symbol",
+					}
+				}
+			}
+
+			flags := scipgraph.DecodeRoles(occ.GetSymbolRoles())
+			occurrence := store.OccurrenceData{
+				FilePath:           relativePath,
+				Symbol:             occ.GetSymbol(),
+				StartLine:          rng.StartLine,
+				StartCol:           rng.StartCol,
+				EndLine:            rng.EndLine,
+				EndCol:             rng.EndCol,
+				EnclosingStartLine: enclosing.StartLine,
+				EnclosingStartCol:  enclosing.StartCol,
+				EnclosingEndLine:   enclosing.EndLine,
+				EnclosingEndCol:    enclosing.EndCol,
+				RoleBits:           int(occ.GetSymbolRoles()),
+				SyntaxKind:         firstNonEmpty(scipgraph.NormalizeSyntaxKind(occ.GetSyntaxKind()), "reference"),
+				IsDefinition:       flags.Definition,
+				IsImport:           flags.Import,
+				IsRead:             flags.Read,
+				IsWrite:            flags.Write,
+			}
+			if occurrence.Symbol != "" {
+				occurrences = append(occurrences, occurrence)
+			}
+
+			if flags.Definition && occ.GetSymbol() != "" {
+				symbolData := symbolMap[occ.GetSymbol()]
+				if symbolData.ScipSymbol != "" {
+					symbolData.FilePath = relativePath
+					symbolData.DefStartLine = enclosing.StartLine
+					symbolData.DefStartCol = enclosing.StartCol
+					symbolData.DefEndLine = enclosing.EndLine
+					symbolData.DefEndCol = enclosing.EndCol
+					if symbolData.DisplayName == "" || symbolData.DisplayName == symbolData.ScipSymbol {
+						symbolData.DisplayName = adapter.NormalizeDisplayName(occ.GetSymbol())
+					}
+					symbolMap[occ.GetSymbol()] = symbolData
+				}
+				defs = append(defs, defOccurrence{
+					FilePath: relativePath,
+					Symbol:   occ.GetSymbol(),
+					Range:    enclosing,
+				})
+			}
+		}
+
+		// Only run tree-sitter chunk extraction for changed files.
+		if _, unchanged := unchangedFiles[relativePath]; unchanged {
+			continue
+		}
+
+		astChunks, err := adapter.SyntaxExtractor().Extract(ctx, relativePath, content)
+		if err != nil {
+			return store.IndexPayload{}, fmt.Errorf("extract chunks for %s: %w", relativePath, err)
+		}
+
+		for _, chunk := range astChunks {
+			chunks = append(chunks, store.ChunkData{
+				Key:        chunk.Key,
+				FilePath:   chunk.FilePath,
+				Kind:       chunk.Kind,
+				Name:       chunk.Name,
+				ParentKey:  chunk.ParentKey,
+				StartByte:  chunk.StartByte,
+				EndByte:    chunk.EndByte,
+				StartLine:  chunk.StartLine,
+				StartCol:   chunk.StartCol,
+				EndLine:    chunk.EndLine,
+				EndCol:     chunk.EndCol,
+				Text:       chunk.Text,
+				HeaderText: chunk.HeaderText,
+			})
+		}
+	}
+
+	// Include cached chunks from unchanged files so assignPrimarySymbols,
+	// deriveChunkSymbolLinks, and buildRetrievalText operate on the full set.
+	for _, cc := range cachedChunks {
+		if _, unchanged := unchangedFiles[cc.FilePath]; unchanged {
+			chunks = append(chunks, cc)
+		}
+	}
+
+	assignPrimarySymbols(chunks, defs, symbolMap, adapter.NormalizeDisplayName)
+	chunkSymbols := deriveChunkSymbolLinks(chunks, occurrences)
+
+	chunkSymbolsByKey := map[string][]store.ChunkSymbolLinkData{}
+	for _, link := range chunkSymbols {
+		chunkSymbolsByKey[link.ChunkKey] = append(chunkSymbolsByKey[link.ChunkKey], link)
+	}
+
+	for i := range chunks {
+		chunks[i].RetrievalText = buildRetrievalText(chunks[i], symbolMap[chunks[i].PrimarySymbol], chunkSymbolsByKey[chunks[i].Key], symbolMap, edges)
+	}
+
+	// Build embed docs only for changed chunks (not cached in unchanged files).
+	var newEmbedDocs []embed.Document
+	for _, chunk := range chunks {
+		if _, cached := cachedEmbeddings[chunk.Key]; cached {
+			continue
+		}
+		newEmbedDocs = append(newEmbedDocs, embed.Document{
+			OwnerType: "chunk",
+			OwnerKey:  chunk.Key,
+			Text:      chunk.RetrievalText,
+		})
+	}
+
+	// Only include embeddings for changed/new chunks in the payload.
+	// Unchanged chunks' embeddings are already in the DB and will be preserved.
+	var embeddings []store.EmbeddingData
+	if len(newEmbedDocs) > 0 {
+		vectors, err := embedder.Embed(ctx, newEmbedDocs)
+		if err != nil {
+			return store.IndexPayload{}, err
+		}
+		vectorByKey := make(map[string][]float32, len(vectors))
+		for _, vector := range vectors {
+			vectorByKey[embeddingMapKey(vector.OwnerType, vector.OwnerKey)] = vector.Values
+		}
+		for _, doc := range newEmbedDocs {
+			vector := vectorByKey[embeddingMapKey(doc.OwnerType, doc.OwnerKey)]
+			if len(vector) == 0 {
+				continue
+			}
+			embeddings = append(embeddings, store.EmbeddingData{
+				OwnerType: doc.OwnerType,
+				OwnerKey:  doc.OwnerKey,
+				Model:     embedder.Name(),
+				TextHash:  sha256Hex([]byte(doc.Text)),
+				Text:      doc.Text,
+				Vector:    vector,
+			})
+		}
 	}
 
 	files := mapsToSortedFiles(fileMap)

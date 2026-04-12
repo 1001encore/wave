@@ -3,8 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -802,6 +804,456 @@ func (s *Store) ReplaceProjectIndex(ctx context.Context, payload IndexPayload) e
 	return nil
 }
 
+// IncrementalUpdateProjectIndex updates the index for a project by only replacing
+// data for changed files. Files in unchangedFiles are left untouched in the database.
+// Symbols and edges are always fully rebuilt since they are cross-file.
+func (s *Store) IncrementalUpdateProjectIndex(ctx context.Context, payload IndexPayload, unchangedFiles map[string]struct{}) error {
+	cleanRoot := filepath.Clean(payload.Project.RootPath)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.ExecContext(ctx, `PRAGMA foreign_keys = ON`); err != nil {
+		return fmt.Errorf("enable foreign keys: %w", err)
+	}
+
+	// Look up existing project.
+	var projectID int64
+	if err = tx.QueryRowContext(
+		ctx,
+		`SELECT id FROM projects WHERE root_path = ? AND adapter_id = ?`,
+		cleanRoot,
+		payload.Project.AdapterID,
+	).Scan(&projectID); err != nil {
+		return fmt.Errorf("lookup existing project: %w", err)
+	}
+
+	// Update project metadata.
+	now := time.Now().UTC().Format(time.RFC3339)
+	if _, err = tx.ExecContext(
+		ctx,
+		`UPDATE projects SET
+			name = ?, language = ?, manifest_path = ?, environment_source = ?,
+			scip_artifact_path = ?, tool_name = ?, tool_version = ?,
+			last_indexed_at = ?, git_commit_hash = ?
+		WHERE id = ?`,
+		payload.Project.Name,
+		payload.Project.Language,
+		payload.Project.ManifestPath,
+		payload.Project.EnvironmentSource,
+		payload.Project.ScipArtifactPath,
+		payload.Project.ToolName,
+		payload.Project.ToolVersion,
+		now,
+		payload.Project.GitCommitHash,
+		projectID,
+	); err != nil {
+		return fmt.Errorf("update project metadata: %w", err)
+	}
+
+	// Collect IDs of files that will be replaced (changed/deleted).
+	changedFileIDs := []int64{}
+	{
+		rows, qErr := tx.QueryContext(ctx,
+			`SELECT id, relative_path FROM files WHERE project_id = ?`, projectID)
+		if qErr != nil {
+			return fmt.Errorf("query existing files: %w", qErr)
+		}
+		for rows.Next() {
+			var fid int64
+			var relPath string
+			if scanErr := rows.Scan(&fid, &relPath); scanErr != nil {
+				rows.Close()
+				return fmt.Errorf("scan existing file: %w", scanErr)
+			}
+			if _, unchanged := unchangedFiles[relPath]; !unchanged {
+				changedFileIDs = append(changedFileIDs, fid)
+			}
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return fmt.Errorf("iterate existing files: %w", rows.Err())
+		}
+	}
+
+	// Delete vec_chunks for changed files' chunks before deleting the chunks.
+	if len(changedFileIDs) > 0 {
+		for _, fid := range changedFileIDs {
+			if _, err = tx.ExecContext(ctx,
+				`DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM chunks WHERE project_id = ? AND file_id = ?)`,
+				projectID, fid); err != nil {
+				return fmt.Errorf("delete vec_chunks for changed file: %w", err)
+			}
+		}
+		// Delete the file rows — CASCADE removes occurrences, chunks, chunk_symbols.
+		for _, fid := range changedFileIDs {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM files WHERE id = ?`, fid); err != nil {
+				return fmt.Errorf("delete changed file: %w", err)
+			}
+		}
+	}
+
+	// Delete ALL symbols and edges (cross-file, cheap to rebuild).
+	if _, err = tx.ExecContext(ctx,
+		`DELETE FROM vec_symbols WHERE rowid IN (SELECT id FROM symbols WHERE project_id = ?)`,
+		projectID); err != nil {
+		return fmt.Errorf("delete vec_symbols: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM edges WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete edges: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM chunk_symbols WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete chunk_symbols: %w", err)
+	}
+	// Unlink symbols from chunks before deleting symbols.
+	if _, err = tx.ExecContext(ctx, `UPDATE chunks SET primary_symbol_id = NULL WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("unlink chunk primary symbols: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM occurrences WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete occurrences: %w", err)
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM symbols WHERE project_id = ?`, projectID); err != nil {
+		return fmt.Errorf("delete symbols: %w", err)
+	}
+
+	// Re-insert files only for changed/new files.
+	fileIDs := make(map[string]int64, len(payload.Files))
+	// First, collect IDs for unchanged files that are still in the DB.
+	{
+		rows, qErr := tx.QueryContext(ctx,
+			`SELECT id, relative_path FROM files WHERE project_id = ?`, projectID)
+		if qErr != nil {
+			return fmt.Errorf("query remaining files: %w", qErr)
+		}
+		for rows.Next() {
+			var fid int64
+			var relPath string
+			if scanErr := rows.Scan(&fid, &relPath); scanErr != nil {
+				rows.Close()
+				return fmt.Errorf("scan remaining file: %w", scanErr)
+			}
+			fileIDs[relPath] = fid
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return fmt.Errorf("iterate remaining files: %w", rows.Err())
+		}
+	}
+	for _, file := range payload.Files {
+		if _, exists := fileIDs[file.RelativePath]; exists {
+			continue // unchanged file, already in DB
+		}
+		res, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO files (project_id, relative_path, abs_path, language, content_hash, line_count)
+				 VALUES (?, ?, ?, ?, ?, ?)`,
+			projectID,
+			file.RelativePath,
+			file.AbsPath,
+			file.Language,
+			file.ContentHash,
+			file.LineCount,
+		)
+		if execErr != nil {
+			return fmt.Errorf("insert file %s: %w", file.RelativePath, execErr)
+		}
+		id, idErr := res.LastInsertId()
+		if idErr != nil {
+			return fmt.Errorf("get file id for %s: %w", file.RelativePath, idErr)
+		}
+		fileIDs[file.RelativePath] = id
+	}
+
+	// Re-insert ALL symbols.
+	symbolIDs := make(map[string]int64, len(payload.Symbols))
+	for _, symbol := range payload.Symbols {
+		var fileID any
+		if symbol.FilePath != "" {
+			id, ok := fileIDs[symbol.FilePath]
+			if ok {
+				fileID = id
+			}
+		}
+
+		res, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO symbols (
+				project_id, scip_symbol, display_name, kind, file_id,
+				def_start_line, def_start_col, def_end_line, def_end_col,
+				signature, doc_summary, enclosing_symbol
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			projectID,
+			symbol.ScipSymbol,
+			symbol.DisplayName,
+			symbol.Kind,
+			fileID,
+			symbol.DefStartLine,
+			symbol.DefStartCol,
+			symbol.DefEndLine,
+			symbol.DefEndCol,
+			symbol.Signature,
+			symbol.DocSummary,
+			symbol.EnclosingSymbol,
+		)
+		if execErr != nil {
+			return fmt.Errorf("insert symbol %s: %w", symbol.ScipSymbol, execErr)
+		}
+		id, idErr := res.LastInsertId()
+		if idErr != nil {
+			return fmt.Errorf("get symbol id for %s: %w", symbol.ScipSymbol, idErr)
+		}
+		symbolIDs[symbol.ScipSymbol] = id
+	}
+
+	// Re-insert ALL occurrences.
+	for _, occ := range payload.Occurrences {
+		fileID, ok := fileIDs[occ.FilePath]
+		if !ok {
+			continue
+		}
+		symbolID, ok := symbolIDs[occ.Symbol]
+		if !ok {
+			continue
+		}
+
+		if _, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO occurrences (
+				project_id, symbol_id, file_id, start_line, start_col, end_line, end_col,
+				enclosing_start_line, enclosing_start_col, enclosing_end_line, enclosing_end_col,
+				role_bits, syntax_kind, is_definition, is_import, is_read, is_write
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			projectID,
+			symbolID,
+			fileID,
+			occ.StartLine,
+			occ.StartCol,
+			occ.EndLine,
+			occ.EndCol,
+			occ.EnclosingStartLine,
+			occ.EnclosingStartCol,
+			occ.EnclosingEndLine,
+			occ.EnclosingEndCol,
+			occ.RoleBits,
+			occ.SyntaxKind,
+			boolToInt(occ.IsDefinition),
+			boolToInt(occ.IsImport),
+			boolToInt(occ.IsRead),
+			boolToInt(occ.IsWrite),
+		); execErr != nil {
+			return fmt.Errorf("insert occurrence for %s: %w", occ.Symbol, execErr)
+		}
+	}
+
+	// Insert chunks only for changed/new files.
+	chunkIDs := make(map[string]int64, len(payload.Chunks))
+	// Collect IDs for existing unchanged chunks.
+	{
+		rows, qErr := tx.QueryContext(ctx,
+			`SELECT id, chunk_key FROM chunks WHERE project_id = ?`, projectID)
+		if qErr != nil {
+			return fmt.Errorf("query remaining chunks: %w", qErr)
+		}
+		for rows.Next() {
+			var cid int64
+			var key string
+			if scanErr := rows.Scan(&cid, &key); scanErr != nil {
+				rows.Close()
+				return fmt.Errorf("scan remaining chunk: %w", scanErr)
+			}
+			chunkIDs[key] = cid
+		}
+		rows.Close()
+		if rows.Err() != nil {
+			return fmt.Errorf("iterate remaining chunks: %w", rows.Err())
+		}
+	}
+	for _, chunk := range payload.Chunks {
+		if _, exists := chunkIDs[chunk.Key]; exists {
+			continue // unchanged chunk, already in DB
+		}
+		fileID, ok := fileIDs[chunk.FilePath]
+		if !ok {
+			continue
+		}
+
+		var primarySymbolID any
+		if chunk.PrimarySymbol != "" {
+			if id, exists := symbolIDs[chunk.PrimarySymbol]; exists {
+				primarySymbolID = id
+			}
+		}
+
+		res, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO chunks (
+				project_id, file_id, primary_symbol_id, parent_chunk_id, chunk_key, kind, name,
+				start_byte, end_byte, start_line, start_col, end_line, end_col,
+				header_text, text, retrieval_text
+			) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			projectID,
+			fileID,
+			primarySymbolID,
+			chunk.Key,
+			chunk.Kind,
+			chunk.Name,
+			chunk.StartByte,
+			chunk.EndByte,
+			chunk.StartLine,
+			chunk.StartCol,
+			chunk.EndLine,
+			chunk.EndCol,
+			chunk.HeaderText,
+			chunk.Text,
+			chunk.RetrievalText,
+		)
+		if execErr != nil {
+			return fmt.Errorf("insert chunk %s: %w", chunk.Key, execErr)
+		}
+		id, idErr := res.LastInsertId()
+		if idErr != nil {
+			return fmt.Errorf("get chunk id for %s: %w", chunk.Key, idErr)
+		}
+		chunkIDs[chunk.Key] = id
+	}
+
+	// Update primary_symbol_id and parent links for ALL chunks (including unchanged).
+	for _, chunk := range payload.Chunks {
+		chunkID, ok := chunkIDs[chunk.Key]
+		if !ok {
+			continue
+		}
+		var primarySymbolID any
+		if chunk.PrimarySymbol != "" {
+			if id, exists := symbolIDs[chunk.PrimarySymbol]; exists {
+				primarySymbolID = id
+			}
+		}
+		if _, execErr := tx.ExecContext(ctx,
+			`UPDATE chunks SET primary_symbol_id = ? WHERE id = ?`,
+			primarySymbolID, chunkID); execErr != nil {
+			return fmt.Errorf("update chunk primary symbol for %s: %w", chunk.Key, execErr)
+		}
+	}
+
+	for _, chunk := range payload.Chunks {
+		if chunk.ParentKey == "" {
+			continue
+		}
+		chunkID, ok := chunkIDs[chunk.Key]
+		if !ok {
+			continue
+		}
+		parentID, ok := chunkIDs[chunk.ParentKey]
+		if !ok {
+			continue
+		}
+		if _, execErr := tx.ExecContext(ctx, `UPDATE chunks SET parent_chunk_id = ? WHERE id = ?`, parentID, chunkID); execErr != nil {
+			return fmt.Errorf("link chunk parent for %s: %w", chunk.Key, execErr)
+		}
+	}
+
+	// Re-insert ALL chunk_symbols.
+	for _, link := range payload.ChunkSymbols {
+		chunkID, ok := chunkIDs[link.ChunkKey]
+		if !ok {
+			continue
+		}
+		symbolID, ok := symbolIDs[link.Symbol]
+		if !ok {
+			continue
+		}
+		if _, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO chunk_symbols (project_id, chunk_id, symbol_id, role, weight)
+			 VALUES (?, ?, ?, ?, ?)`,
+			projectID,
+			chunkID,
+			symbolID,
+			link.Role,
+			link.Weight,
+		); execErr != nil {
+			return fmt.Errorf("insert chunk symbol link %s -> %s: %w", link.ChunkKey, link.Symbol, execErr)
+		}
+	}
+
+	// Re-insert ALL edges.
+	for _, edge := range payload.Edges {
+		srcID, ok := symbolIDs[edge.SrcSymbol]
+		if !ok {
+			continue
+		}
+		dstID, ok := symbolIDs[edge.DstSymbol]
+		if !ok {
+			continue
+		}
+		if _, execErr := tx.ExecContext(
+			ctx,
+			`INSERT INTO edges (project_id, src_symbol_id, dst_symbol_id, kind, provenance)
+			 VALUES (?, ?, ?, ?, ?)`,
+			projectID,
+			srcID,
+			dstID,
+			edge.Kind,
+			edge.Provenance,
+		); execErr != nil {
+			return fmt.Errorf("insert edge %s -> %s: %w", edge.SrcSymbol, edge.DstSymbol, execErr)
+		}
+	}
+
+	// Insert embeddings only for changed/new chunks.
+	for _, embedding := range payload.Embeddings {
+		blob, blobErr := vec.SerializeFloat32(embedding.Vector)
+		if blobErr != nil {
+			return fmt.Errorf("serialize embedding for %s: %w", embedding.OwnerKey, blobErr)
+		}
+		switch embedding.OwnerType {
+		case "chunk":
+			chunkID, ok := chunkIDs[embedding.OwnerKey]
+			if !ok {
+				continue
+			}
+			// Use INSERT OR REPLACE to handle both new and existing chunks.
+			if _, execErr := tx.ExecContext(
+				ctx,
+				`INSERT OR REPLACE INTO vec_chunks (rowid, embedding) VALUES (?, ?)`,
+				chunkID,
+				blob,
+			); execErr != nil {
+				return fmt.Errorf("insert chunk vector for %s: %w", embedding.OwnerKey, execErr)
+			}
+		}
+	}
+
+	if _, err = tx.ExecContext(
+		ctx,
+		`INSERT INTO index_runs (
+			project_id, started_at, completed_at, status, files_indexed, symbols_indexed, chunks_indexed, error_text
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		projectID,
+		now,
+		now,
+		"ok",
+		len(payload.Files),
+		len(payload.Symbols),
+		len(payload.Chunks),
+		"",
+	); err != nil {
+		return fmt.Errorf("insert index run: %w", err)
+	}
+
+	if err = tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) DeleteProjectsExceptAdapters(ctx context.Context, rootPath string, adapterIDs []string) error {
 	cleanRoot := filepath.Clean(rootPath)
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -967,6 +1419,96 @@ func (s *Store) IndexedFiles(ctx context.Context, rootPath string, adapterID str
 			return nil, fmt.Errorf("scan indexed file: %w", err)
 		}
 		result[row.RelativePath] = row
+	}
+	return result, rows.Err()
+}
+
+// IndexedChunkEmbeddings returns the stored embeddings for a project keyed by chunk_key.
+// This allows incremental re-indexing to reuse embeddings for unchanged chunks.
+func (s *Store) IndexedChunkEmbeddings(ctx context.Context, rootPath string, adapterID string) (map[string]EmbeddingData, error) {
+	cleanRoot := filepath.Clean(rootPath)
+
+	query := `SELECT c.chunk_key, vc.embedding
+		FROM chunks c
+		JOIN projects p ON p.id = c.project_id
+		JOIN vec_chunks vc ON vc.rowid = c.id
+		WHERE p.root_path = ?`
+	args := []any{cleanRoot}
+	if strings.TrimSpace(adapterID) != "" {
+		query += ` AND p.adapter_id = ?`
+		args = append(args, adapterID)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query indexed chunk embeddings: %w", err)
+	}
+	defer rows.Close()
+
+	result := map[string]EmbeddingData{}
+	for rows.Next() {
+		var key string
+		var blob []byte
+		if err := rows.Scan(&key, &blob); err != nil {
+			return nil, fmt.Errorf("scan chunk embedding: %w", err)
+		}
+		if len(blob)%4 != 0 {
+			continue
+		}
+		vector := make([]float32, len(blob)/4)
+		for i := range vector {
+			vector[i] = math.Float32frombits(binary.LittleEndian.Uint32(blob[i*4 : i*4+4]))
+		}
+		result[key] = EmbeddingData{
+			OwnerType: "chunk",
+			OwnerKey:  key,
+			Vector:    vector,
+		}
+	}
+	return result, rows.Err()
+}
+
+// IndexedChunks returns stored chunks for a project, keyed by chunk_key.
+// Used during incremental re-indexing to include unchanged file chunks in payload processing.
+func (s *Store) IndexedChunks(ctx context.Context, rootPath string, adapterID string) ([]ChunkData, error) {
+	cleanRoot := filepath.Clean(rootPath)
+
+	query := `SELECT c.chunk_key, f.relative_path, c.kind, c.name, c.start_byte, c.end_byte,
+		c.start_line, c.start_col, c.end_line, c.end_col,
+		c.header_text, c.text, c.retrieval_text,
+		COALESCE(s.scip_symbol, ''),
+		COALESCE(pc.chunk_key, '')
+		FROM chunks c
+		JOIN files f ON f.id = c.file_id
+		JOIN projects p ON p.id = c.project_id
+		LEFT JOIN symbols s ON s.id = c.primary_symbol_id
+		LEFT JOIN chunks pc ON pc.id = c.parent_chunk_id
+		WHERE p.root_path = ?`
+	args := []any{cleanRoot}
+	if strings.TrimSpace(adapterID) != "" {
+		query += ` AND p.adapter_id = ?`
+		args = append(args, adapterID)
+	}
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query indexed chunks: %w", err)
+	}
+	defer rows.Close()
+
+	var result []ChunkData
+	for rows.Next() {
+		var c ChunkData
+		if err := rows.Scan(
+			&c.Key, &c.FilePath, &c.Kind, &c.Name,
+			&c.StartByte, &c.EndByte,
+			&c.StartLine, &c.StartCol, &c.EndLine, &c.EndCol,
+			&c.HeaderText, &c.Text, &c.RetrievalText,
+			&c.PrimarySymbol, &c.ParentKey,
+		); err != nil {
+			return nil, fmt.Errorf("scan indexed chunk: %w", err)
+		}
+		result = append(result, c)
 	}
 	return result, rows.Err()
 }
