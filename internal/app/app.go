@@ -93,8 +93,8 @@ const (
 	defaultResultLimit             = 10
 	defaultDefLimit                = 3
 	defaultRefsLimit               = 3
-	defaultAdaptiveClipMinKeep     = 3
-	adaptiveClipSoftmaxFloor       = 0.85
+	defaultAdaptiveClipMinKeep     = 1
+	adaptiveClipSoftmaxFloor       = 0.90
 	adaptiveClipNextProbCeiling    = 0.05
 	releaseRepoOwner               = "1001encore"
 	releaseRepoName                = "wave"
@@ -299,7 +299,7 @@ func runSearch(ctx context.Context, args []string) int {
 	fs.IntVar(&cc.previewChars, "preview-chars", 120, "maximum preview length in characters")
 	fs.BoolVar(&cc.showSignature, "signature", false, "show SCIP signature")
 	fs.BoolVar(&showScore, "show-score", false, "include raw rerank scores in output")
-	fs.BoolVar(&showSoftmax, "show-softmax", false, "include softmax probabilities over returned hits (relative within this result set)")
+	fs.BoolVar(&showSoftmax, "show-prob", false, "include probability per hit (relative within this result set)")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -335,9 +335,8 @@ func runSearch(ctx context.Context, args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	clippedMatches := false
 	if shouldApplyDefaultAdaptiveClip(cc.limit, limitExplicit) {
-		result.Hits, clippedMatches = clipSearchHitsBySoftmax(result.Hits)
+		result.Hits, _ = clipSearchHitsBySoftmax(result.Hits)
 	}
 	printFreshnessWarning(ctx, st, units, cc)
 	if cc.jsonOut {
@@ -356,11 +355,7 @@ func runSearch(ctx context.Context, args []string) int {
 	if showSoftmax {
 		softmax = outputSoftmaxProbabilities(result.Hits)
 	}
-	if clippedMatches {
-		fmt.Printf("Top Matches: %d, use --limit to show more\n", len(result.Hits))
-	} else {
-		fmt.Printf("Top Matches: %d\n", len(result.Hits))
-	}
+	fmt.Printf("Top Matches: %d\n", len(result.Hits))
 	for i, hit := range result.Hits {
 		displayPath := formatSearchDisplayPath(rootPath, hit.Path)
 		kind := prettifySearchKind(hit.Kind)
@@ -371,18 +366,18 @@ func runSearch(ctx context.Context, args []string) int {
 				parts = append(parts, fmt.Sprintf("score=%.3f", hit.Score))
 			}
 			if showSoftmax {
-				parts = append(parts, fmt.Sprintf("softmax=%.1f%%", softmax[i]*100))
+				parts = append(parts, fmt.Sprintf("prob=%.1f%%", softmax[i]*100))
 			}
 			summary = fmt.Sprintf("%s  [%s]", summary, strings.Join(parts, ", "))
 		}
 		fmt.Printf(
-			"%d. %s at %s:%d-%d [%s]\n",
+			"%d. [%s] %s at %s:%d-%d\n",
 			i+1,
+			kind,
 			summary,
 			displayPath,
 			hit.StartLine+1,
 			hit.EndLine+1,
-			kind,
 		)
 		if cc.showSignature {
 			if signature := strings.TrimSpace(hit.Signature); signature != "" {
@@ -414,6 +409,8 @@ func runSearch(ctx context.Context, args []string) int {
 func runDef(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("def", flag.ContinueOnError)
 	cc := bindCommonFlagsWithLimit(fs, defaultDefLimit)
+	var fullSource bool
+	fs.BoolVar(&fullSource, "full-source", false, "show full source code without line limit")
 	if err := fs.Parse(args); err != nil {
 		return 1
 	}
@@ -470,7 +467,35 @@ func runDef(ctx context.Context, args []string) int {
 		printJSON(definitionJSONPayload(result, cc.explain))
 		return 0
 	}
-	writeDefinitionOutput(os.Stdout, rootPath, symbol, result, cc.explain, cc.limit)
+	if cc.explain {
+		fmt.Printf("Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
+	}
+	writeDefinitionOutput(os.Stdout, rootPath, result, fullSource)
+	if result.Definition != nil {
+		related, relErr := st.RelatedChunks(ctx, rootPath, result.Definition.SymbolID, 6)
+		if relErr == nil {
+			related = filterLowValueRelationships(related)
+			if len(related) > 0 {
+				fmt.Println("Relationships:")
+				tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+				fmt.Fprintln(tw, "DIRECTION\tRELATION\tLOCATION\tNAME")
+				for _, rel := range related {
+					relDisplayPath := formatSearchDisplayPath(rootPath, rel.Path)
+					fmt.Fprintf(
+						tw,
+						"%s\t%s\t%s:%d-%d\t%s\n",
+						rel.Direction,
+						rel.RelationKind,
+						relDisplayPath,
+						rel.StartLine+1,
+						rel.EndLine+1,
+						firstNonEmpty(rel.DisplayName, rel.Name),
+					)
+				}
+				_ = tw.Flush()
+			}
+		}
+	}
 	return 0
 }
 
@@ -2628,7 +2653,17 @@ func prettifySearchKind(kind string) string {
 		}
 		words[i] = strings.ToUpper(word[:1]) + word[1:]
 	}
-	return strings.Join(words, " ")
+	expanded := strings.Join(words, " ")
+	switch expanded {
+	case "Func":
+		return "Function"
+	case "Var":
+		return "Variable"
+	case "Impl":
+		return "Implementation"
+	default:
+		return expanded
+	}
 }
 
 func searchCodePreview(headerText string, maxChars int) string {
@@ -2724,7 +2759,7 @@ type searchHitOutput struct {
 	HeaderText         string   `json:"header_text"`
 	Text               string   `json:"text"`
 	Score              *float64 `json:"score,omitempty"`
-	SoftmaxProbability *float64 `json:"softmax_probability,omitempty"`
+	Probability *float64 `json:"probability,omitempty"`
 }
 
 type searchResultOutput struct {
@@ -2767,7 +2802,7 @@ func searchHitsOutput(hits []store.SearchHit, includeScore bool, includeSoftmax 
 		}
 		if includeSoftmax {
 			prob := softmax[i]
-			item.SoftmaxProbability = &prob
+			item.Probability = &prob
 		}
 		out = append(out, item)
 	}
@@ -2921,63 +2956,81 @@ func definitionJSONPayload(result queryrouter.DefinitionResult, explain bool) an
 	return result.Definition
 }
 
-func writeDefinitionOutput(w io.Writer, rootPath string, symbol string, result queryrouter.DefinitionResult, explain bool, alternateLimit int) {
-	if explain {
-		fmt.Fprintf(w, "Route: %s (%s)\n", result.Plan.Mode, result.Plan.Reason)
-	}
-	printDefinitionEntry(w, rootPath, "Definition", result.Definition)
+const defaultDefSourceMaxLines = 200
 
-	if len(result.Candidates) == 0 {
-		return
-	}
-
-	alternates := make([]store.DefinitionResult, 0, len(result.Candidates))
-	for _, candidate := range result.Candidates {
-		if result.Definition != nil && candidate.SymbolID == result.Definition.SymbolID {
-			continue
-		}
-		alternates = append(alternates, candidate)
-	}
-	if len(alternates) == 0 {
-		return
-	}
-
-	fmt.Fprintln(w, "---")
-	fmt.Fprintf(w, "Other matches for %q:\n", symbol)
-	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tw, "NAME\tKIND\tLOCATION")
-	limit := len(alternates)
-	if alternateLimit > 0 {
-		limit = min(limit, alternateLimit)
-	}
-	for _, candidate := range alternates[:limit] {
-		displayPath := formatSearchDisplayPath(rootPath, candidate.Path)
-		fmt.Fprintf(
-			tw,
-			"%s\t%s\t%s:%d:%d\n",
-			candidate.DisplayName,
-			firstNonEmpty(candidate.Kind, "symbol"),
-			displayPath,
-			candidate.StartLine+1,
-			candidate.StartCol+1,
-		)
-	}
-	_ = tw.Flush()
-	if len(alternates) > limit {
-		fmt.Fprintf(w, "... and %d more\n", len(alternates)-limit)
-	}
+func writeDefinitionOutput(w io.Writer, rootPath string, result queryrouter.DefinitionResult, fullSource bool) {
+	printDefinitionEntry(w, rootPath, result.Definition, result.Chunk, fullSource)
 }
 
-func printDefinitionEntry(w io.Writer, rootPath string, label string, def *store.DefinitionResult) {
+func printDefinitionEntry(w io.Writer, rootPath string, def *store.DefinitionResult, chunk *store.SearchHit, fullSource bool) {
 	if def == nil {
 		return
 	}
 	displayPath := formatSearchDisplayPath(rootPath, def.Path)
-	fmt.Fprintf(w, "%s: %s [%s]\n", label, def.DisplayName, def.Kind)
 	fmt.Fprintf(w, "Location: %s:%d:%d\n", displayPath, def.StartLine+1, def.StartCol+1)
-	if doc := formatDocSummary(def.DocSummary); doc != "" {
-		fmt.Fprintf(w, "Doc: %s\n", doc)
+	sig := strings.TrimSpace(def.Signature)
+	hasSig := false
+	if sig != "" {
+		fmt.Fprintf(w, "Signature: %s\n", sig)
+		hasSig = true
+	} else if chunk != nil {
+		if preview := searchCodePreview(firstNonEmpty(chunk.HeaderText, chunk.Text), 200); preview != "" {
+			fmt.Fprintf(w, "Signature: %s\n", preview)
+			hasSig = true
+		}
 	}
+	if chunk != nil && strings.TrimSpace(chunk.Text) != "" {
+		text := chunk.Text
+		if !fullSource {
+			text = truncateLines(text, defaultDefSourceMaxLines)
+		}
+		fmt.Fprintf(w, "Source:\n%s\n", text)
+	} else if !hasSig {
+		if doc := formatDocSummary(def.DocSummary); doc != "" {
+			fmt.Fprintf(w, "Doc: %s\n", doc)
+		}
+	}
+}
+
+func truncateLines(s string, maxLines int) string {
+	lines := strings.SplitAfter(s, "\n")
+	if len(lines) <= maxLines {
+		return s
+	}
+	return strings.Join(lines[:maxLines], "") + fmt.Sprintf("\n... (%d lines truncated, use --full-source to show all)", len(lines)-maxLines)
+}
+
+func filterLowValueRelationships(related []store.RelatedChunk) []store.RelatedChunk {
+	filtered := make([]store.RelatedChunk, 0, len(related))
+	for _, rel := range related {
+		if isLowValuePath(rel.Path) {
+			continue
+		}
+		filtered = append(filtered, rel)
+	}
+	return filtered
+}
+
+func isLowValuePath(p string) bool {
+	base := filepath.Base(p)
+	if strings.HasSuffix(base, "_test.go") ||
+		strings.HasSuffix(base, ".test.ts") ||
+		strings.HasSuffix(base, ".test.js") ||
+		strings.HasSuffix(base, ".spec.ts") ||
+		strings.HasSuffix(base, ".spec.js") ||
+		strings.HasSuffix(base, "_test.py") ||
+		strings.HasPrefix(base, "test_") ||
+		strings.HasSuffix(base, ".pb.go") ||
+		strings.HasSuffix(base, "_pb2.py") ||
+		strings.HasSuffix(base, ".generated.go") {
+		return true
+	}
+	for _, seg := range strings.Split(filepath.ToSlash(p), "/") {
+		if seg == "testdata" {
+			return true
+		}
+	}
+	return false
 }
 
 func formatDocSummary(summary string) string {

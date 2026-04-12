@@ -68,8 +68,8 @@ Expose score fields only when needed:
 
 ```bash
 wave search --show-score "Router"
-wave search --show-softmax "auth middleware"
-wave search --json --show-score --show-softmax "handleRequest"
+wave search --show-prob "auth middleware"
+wave search --json --show-score --show-prob "handleRequest"
 ```
 
 ## Practical Tips

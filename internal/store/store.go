@@ -191,7 +191,7 @@ type SearchHit struct {
 	HeaderText         string  `json:"header_text"`
 	Text               string  `json:"text"`
 	Score              float64 `json:"score"`
-	SoftmaxProbability float64 `json:"softmax_probability,omitempty"`
+	SoftmaxProbability float64 `json:"probability,omitempty"`
 }
 
 type SymbolSearchHit struct {

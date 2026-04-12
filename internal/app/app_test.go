@@ -300,7 +300,7 @@ func TestIndexerInstallSpecForAdapter(t *testing.T) {
 	}
 }
 
-func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
+func TestWriteDefinitionOutputShowsSignatureAndSource(t *testing.T) {
 	root := t.TempDir()
 	def := &store.DefinitionResult{
 		SymbolID:    1,
@@ -309,69 +309,54 @@ func TestWriteDefinitionOutputShowsAlternates(t *testing.T) {
 		Path:        filepath.Join(root, "a.py"),
 		StartLine:   0,
 		StartCol:    0,
-		DocSummary:  "python",
+		DocSummary:  "python doc",
+	}
+	chunk := &store.SearchHit{
+		HeaderText: "func greet(name string) string",
+		Text:       "func greet(name string) string {\n\treturn \"hello \" + name\n}",
 	}
 	result := queryrouter.DefinitionResult{
 		Definition: def,
-		Candidates: []store.DefinitionResult{
-			*def,
-			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "b.ts"), StartLine: 10, StartCol: 3},
-			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "c.rb"), StartLine: 20, StartCol: 5},
-			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "d.go"), StartLine: 30, StartCol: 7},
-		},
+		Chunk:      chunk,
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, root, "greet", result, true, 3)
+	writeDefinitionOutput(&buf, root, result, false)
 	out := buf.String()
 
-	if !strings.Contains(out, "Definition: greet [function]") {
-		t.Fatalf("output missing primary definition:\n%s", out)
-	}
 	if !strings.Contains(out, "Location: ./a.py:1:1") {
-		t.Fatalf("output missing relative primary location:\n%s", out)
+		t.Fatalf("output missing location:\n%s", out)
 	}
-	if !strings.Contains(out, "---") {
-		t.Fatalf("output missing divider:\n%s", out)
+	if !strings.Contains(out, "Signature: func greet(name string) string") {
+		t.Fatalf("output missing signature:\n%s", out)
 	}
-	if !strings.Contains(out, "Other matches for \"greet\":") {
-		t.Fatalf("output missing alternate heading:\n%s", out)
+	if !strings.Contains(out, "Source:") {
+		t.Fatalf("output missing source:\n%s", out)
 	}
-	if !strings.Contains(out, "./b.ts:11:4") || !strings.Contains(out, "./c.rb:21:6") || !strings.Contains(out, "./d.go:31:8") {
-		t.Fatalf("output missing alternates:\n%s", out)
+	if strings.Contains(out, "Doc:") {
+		t.Fatalf("doc should not appear when signature exists:\n%s", out)
 	}
 }
 
-func TestWriteDefinitionOutputRespectsAlternateLimit(t *testing.T) {
+func TestWriteDefinitionOutputDocFallbackWhenNoSigNoChunk(t *testing.T) {
 	root := t.TempDir()
 	def := &store.DefinitionResult{
 		SymbolID:    1,
 		DisplayName: "greet",
 		Kind:        "function",
 		Path:        filepath.Join(root, "a.py"),
+		DocSummary:  "Says hello",
 	}
 	result := queryrouter.DefinitionResult{
 		Definition: def,
-		Candidates: []store.DefinitionResult{
-			*def,
-			{SymbolID: 2, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "b.ts"), StartLine: 10, StartCol: 3},
-			{SymbolID: 3, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "c.rb"), StartLine: 20, StartCol: 5},
-			{SymbolID: 4, DisplayName: "greet", Kind: "function", Path: filepath.Join(root, "d.go"), StartLine: 30, StartCol: 7},
-		},
 	}
 
 	var buf bytes.Buffer
-	writeDefinitionOutput(&buf, root, "greet", result, false, 2)
+	writeDefinitionOutput(&buf, root, result, false)
 	out := buf.String()
 
-	if !strings.Contains(out, "./b.ts:11:4") || !strings.Contains(out, "./c.rb:21:6") {
-		t.Fatalf("output missing expected alternates:\n%s", out)
-	}
-	if strings.Contains(out, "./d.go:31:8") {
-		t.Fatalf("output should be limited to first 2 alternates:\n%s", out)
-	}
-	if !strings.Contains(out, "... and 1 more") {
-		t.Fatalf("output missing overflow count:\n%s", out)
+	if !strings.Contains(out, "Doc: Says hello") {
+		t.Fatalf("output missing doc fallback:\n%s", out)
 	}
 }
 
@@ -427,8 +412,8 @@ func TestSearchHitsOutputOmitsScoresByDefault(t *testing.T) {
 	if out[0].Score != nil {
 		t.Fatalf("score should be omitted by default, got %v", *out[0].Score)
 	}
-	if out[0].SoftmaxProbability != nil {
-		t.Fatalf("softmax_probability should be omitted by default, got %v", *out[0].SoftmaxProbability)
+	if out[0].Probability != nil {
+		t.Fatalf("probability should be omitted by default, got %v", *out[0].Probability)
 	}
 }
 
@@ -446,18 +431,18 @@ func TestSearchHitsOutputIncludesRawAndSoftmaxWhenEnabled(t *testing.T) {
 	if out[0].Score == nil || *out[0].Score != 3.0 {
 		t.Fatalf("first raw score = %#v, want 3.0", out[0].Score)
 	}
-	if out[0].SoftmaxProbability == nil {
-		t.Fatal("first softmax probability should be populated")
+	if out[0].Probability == nil {
+		t.Fatal("first probability should be populated")
 	}
-	if out[1].SoftmaxProbability == nil || out[2].SoftmaxProbability == nil {
-		t.Fatal("softmax probability should be populated for all hits")
+	if out[1].Probability == nil || out[2].Probability == nil {
+		t.Fatal("prob should be populated for all hits")
 	}
-	if *out[0].SoftmaxProbability <= *out[1].SoftmaxProbability || *out[1].SoftmaxProbability <= *out[2].SoftmaxProbability {
+	if *out[0].Probability <= *out[1].Probability || *out[1].Probability <= *out[2].Probability {
 		t.Fatalf(
 			"expected descending softmax probabilities, got %.6f %.6f %.6f",
-			*out[0].SoftmaxProbability,
-			*out[1].SoftmaxProbability,
-			*out[2].SoftmaxProbability,
+			*out[0].Probability,
+			*out[1].Probability,
+			*out[2].Probability,
 		)
 	}
 }
@@ -495,11 +480,11 @@ func TestSearchHitsOutputUsesPrecomputedSoftmaxWhenPresent(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("hit count = %d, want 2", len(out))
 	}
-	if out[0].SoftmaxProbability == nil || out[1].SoftmaxProbability == nil {
+	if out[0].Probability == nil || out[1].Probability == nil {
 		t.Fatal("softmax probabilities should be populated")
 	}
-	if *out[0].SoftmaxProbability != 0.7 || *out[1].SoftmaxProbability != 0.3 {
-		t.Fatalf("softmax probabilities = %.3f %.3f, want 0.700 0.300", *out[0].SoftmaxProbability, *out[1].SoftmaxProbability)
+	if *out[0].Probability != 0.7 || *out[1].Probability != 0.3 {
+		t.Fatalf("softmax probabilities = %.3f %.3f, want 0.700 0.300", *out[0].Probability, *out[1].Probability)
 	}
 }
 
@@ -567,8 +552,8 @@ func TestClipSearchHitsBySoftmaxClipsDominatedTail(t *testing.T) {
 	if !changed {
 		t.Fatal("expected dominated tail to be clipped")
 	}
-	if len(clipped) != 3 {
-		t.Fatalf("clipped len = %d, want 3", len(clipped))
+	if len(clipped) != 1 {
+		t.Fatalf("clipped len = %d, want 1", len(clipped))
 	}
 	sum := 0.0
 	for _, hit := range clipped {
@@ -581,10 +566,10 @@ func TestClipSearchHitsBySoftmaxClipsDominatedTail(t *testing.T) {
 
 func TestClipSearchHitsBySoftmaxKeepsMeaningfulTail(t *testing.T) {
 	hits := []store.SearchHit{
-		{ChunkID: 1, SoftmaxProbability: 0.86},
-		{ChunkID: 2, SoftmaxProbability: 0.05},
-		{ChunkID: 3, SoftmaxProbability: 0.02},
-		{ChunkID: 4, SoftmaxProbability: 0.07},
+		{ChunkID: 1, SoftmaxProbability: 0.50},
+		{ChunkID: 2, SoftmaxProbability: 0.30},
+		{ChunkID: 3, SoftmaxProbability: 0.10},
+		{ChunkID: 4, SoftmaxProbability: 0.10},
 	}
 
 	clipped, changed := clipSearchHitsBySoftmax(hits)
