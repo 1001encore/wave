@@ -171,8 +171,14 @@ def main() -> int:
     processed = 0
     settled_batch_size = batch_size
     start = 0
-    # Sanitize texts: encode_batch requires non-empty strings.
-    texts = [t if isinstance(t, str) and t else " " for t in texts]
+    # Sanitize texts: encode_batch requires non-empty, NUL-free strings.
+    sanitized: list[str] = []
+    for t in texts:
+        if not isinstance(t, str) or not t.strip():
+            sanitized.append(" ")
+        else:
+            sanitized.append(t.replace("\x00", ""))
+    texts = sanitized
 
     while start < len(texts):
         current_batch_size = min(batch_size, len(texts) - start)
@@ -180,7 +186,23 @@ def main() -> int:
         while True:
             batch = texts[start : start + current_batch_size]
             tokenize_started_at = time.perf_counter()
-            encoded = tokenizer.encode_batch(batch)
+            try:
+                encoded = tokenizer.encode_batch(batch)
+            except TypeError:
+                # Fall back to encoding one-by-one to skip problematic inputs.
+                encoded = []
+                for item in batch:
+                    try:
+                        encoded.append(tokenizer.encode(item))
+                    except TypeError:
+                        encoded.append(tokenizer.encode(" "))
+                # Pad individual encodings to uniform length (encode_batch
+                # does this automatically, but individual encode does not).
+                max_len = max(len(e.ids) for e in encoded) if encoded else 0
+                for e in encoded:
+                    pad_count = max_len - len(e.ids)
+                    if pad_count > 0:
+                        e.pad(max_len, pad_id=0, pad_token="[PAD]")
             feed = build_input_feed(session, encoded)
             batch_tokenize_ms = (time.perf_counter() - tokenize_started_at) * 1000.0
             tokenize_ms += batch_tokenize_ms
