@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -441,8 +442,12 @@ func resolvePythonPath(searchRoots []string, device string) (string, error) {
 }
 
 func resolveBasePython(searchRoots []string) (string, error) {
-	if path := firstExistingFile(rootedPath(searchRoots, ".venv", "bin", "python")...); path != "" {
-		return path, nil
+	// Check for project-local venv with platform-appropriate path.
+	for _, root := range searchRoots {
+		p := venvPython(filepath.Join(root, ".venv"))
+		if fileExists(p) {
+			return p, nil
+		}
 	}
 	if path, err := exec.LookPath("python3"); err == nil {
 		return path, nil
@@ -570,6 +575,15 @@ func userCacheDir() (string, error) {
 	return filepath.Join(dir, "wave"), nil
 }
 
+// venvPython returns the platform-specific path to the Python executable
+// inside a virtual environment directory.
+func venvPython(venvDir string) string {
+	if runtime.GOOS == "windows" {
+		return filepath.Join(venvDir, "Scripts", "python.exe")
+	}
+	return filepath.Join(venvDir, "bin", "python")
+}
+
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.IsDir()
@@ -663,7 +677,7 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 		return "", err
 	}
 	runtimeDir := filepath.Join(cacheDir, "runtime")
-	runtimePython := filepath.Join(runtimeDir, "bin", "python")
+	runtimePython := venvPython(runtimeDir)
 
 	if fileExists(runtimePython) {
 		if err := ensurePythonDeps(runtimePython); err == nil {
