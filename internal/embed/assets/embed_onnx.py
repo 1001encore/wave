@@ -171,6 +171,9 @@ def main() -> int:
     processed = 0
     settled_batch_size = batch_size
     start = 0
+    # Sanitize texts: encode_batch requires non-empty strings.
+    texts = [t if isinstance(t, str) and t else " " for t in texts]
+
     while start < len(texts):
         current_batch_size = min(batch_size, len(texts) - start)
         batch_retry_count = 0

@@ -704,6 +704,10 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 		if err := installRuntimePackagesWithUV(runtimePython, "numpy", onnxPackage, "tokenizers"); err != nil {
 			if i+1 < len(packages) {
 				fmt.Fprintf(os.Stderr, "warning: failed to install %s; falling back to %s\n", onnxPackage, packages[i+1])
+				if packages[i+1] == "onnxruntime" {
+					fmt.Fprintln(os.Stderr, "warning: GPU acceleration will not be available; embedding will run on CPU which may be significantly slower")
+					fmt.Fprintln(os.Stderr, "warning: to use GPU, install CUDA 12 toolkit and retry with: wave index --device cuda")
+				}
 			}
 			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w", onnxPackage, err)
 			continue
