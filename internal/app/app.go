@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/1001encore/wave/internal/config"
@@ -1222,33 +1223,51 @@ func performIndex(ctx context.Context, cc *commandContext) (map[string]any, stri
 	var pb *progressBar
 	if !cc.jsonOut {
 		if cc.device == "cuda" || cc.device == "gpu" {
-			fmt.Fprintln(os.Stderr, "GPU found, using CUDA")
+			fmt.Fprintln(os.Stderr, "Embedding device: CUDA")
 		} else {
-			fmt.Fprintln(os.Stderr, "GPU not found, falling back to CPU")
+			fmt.Fprintln(os.Stderr, "Embedding device: CPU")
 		}
 		pb = newProgressBar(os.Stderr, len(units)*4, "Indexing")
+	}
+
+	// Pre-run all SCIP indexers concurrently.
+	type indexJob struct {
+		result indexer.Result
+		err    error
+	}
+	indexResults := make([]indexJob, len(units))
+	var wg sync.WaitGroup
+	for i, item := range units {
+		wg.Add(1)
+		go func(i int, adapter indexer.Adapter, unit workspace.Unit) {
+			defer wg.Done()
+			if err := adapter.Validate(ctx, unit); err != nil {
+				indexResults[i] = indexJob{err: err}
+				return
+			}
+			artifactPath := filepath.Join(paths.ArtifactDir, fmt.Sprintf("index.%s.scip", artifactSuffix(adapter.ID())))
+			result, err := adapter.Index(ctx, unit, artifactPath)
+			indexResults[i] = indexJob{result: result, err: err}
+		}(i, item.Adapter, item.Unit)
+	}
+	if pb != nil {
+		pb.SetDescription("indexing (concurrent)")
+	}
+	wg.Wait()
+	if pb != nil {
+		for range units {
+			pb.Increment()
+		}
 	}
 
 	for i, item := range units {
 		adapter := item.Adapter
 		unit := item.Unit
 
-		if err := adapter.Validate(ctx, unit); err != nil {
-			return nil, "", err
+		if indexResults[i].err != nil {
+			return nil, "", indexResults[i].err
 		}
-
-		stepLabel := fmt.Sprintf("[%d/%d] indexing", i+1, len(units))
-		if pb != nil {
-			pb.SetDescription(stepLabel)
-		}
-		artifactPath := filepath.Join(paths.ArtifactDir, fmt.Sprintf("index.%s.scip", artifactSuffix(adapter.ID())))
-		indexResult, err := adapter.Index(ctx, unit, artifactPath)
-		if err != nil {
-			return nil, "", err
-		}
-		if pb != nil {
-			pb.Increment()
-		}
+		indexResult := indexResults[i].result
 
 		if pb != nil {
 			pb.SetDescription(fmt.Sprintf("[%d/%d] loading SCIP", i+1, len(units)))
@@ -1417,23 +1436,29 @@ func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
 		if !cc.jsonOut {
 			fmt.Fprintln(os.Stderr, "info: no index found for this project; building index before running the command")
 		}
-		_, _, indexErr := performIndex(ctx, cc)
+		indexCC := *cc
+		indexCC.device = "cuda"
+		_, _, indexErr := performIndex(ctx, &indexCC)
 		return indexErr
 	}
 
-	indexedByAdapter := make(map[string]store.StatusRow, len(rows))
+	type rootAdapter struct{ root, adapter string }
+	indexedSet := make(map[rootAdapter]store.StatusRow, len(rows))
 	for _, row := range rows {
-		indexedByAdapter[row.AdapterID] = row
+		indexedSet[rootAdapter{filepath.Clean(row.RootPath), row.AdapterID}] = row
 	}
 
 	detectedByAdapter := make(map[string]struct{}, len(units))
 	for _, item := range units {
 		detectedByAdapter[item.Adapter.ID()] = struct{}{}
-		if _, ok := indexedByAdapter[item.Adapter.ID()]; !ok {
+		rp := filepath.Clean(item.Unit.RootPath)
+		if _, ok := indexedSet[rootAdapter{rp, item.Adapter.ID()}]; !ok {
 			if !cc.jsonOut {
 				fmt.Fprintf(os.Stderr, "info: missing %s index for this workspace; building index\n", item.Unit.Language)
 			}
-			_, _, indexErr := performIndex(ctx, cc)
+			indexCC := *cc
+			indexCC.device = "cuda"
+			_, _, indexErr := performIndex(ctx, &indexCC)
 			return indexErr
 		}
 
@@ -1453,7 +1478,9 @@ func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
 					freshness.LineRatio*100,
 				)
 			}
-			_, _, indexErr := performIndex(ctx, cc)
+			indexCC := *cc
+			indexCC.device = "cuda"
+			_, _, indexErr := performIndex(ctx, &indexCC)
 			return indexErr
 		}
 	}
@@ -1465,7 +1492,9 @@ func maybeAutoReindex(ctx context.Context, cc *commandContext) error {
 		if !cc.jsonOut {
 			fmt.Fprintf(os.Stderr, "info: adapter %s is no longer detected in this workspace; refreshing index\n", firstNonEmpty(row.AdapterID, "unknown"))
 		}
-		_, _, indexErr := performIndex(ctx, cc)
+		indexCC := *cc
+		indexCC.device = "cuda"
+		_, _, indexErr := performIndex(ctx, &indexCC)
 		return indexErr
 	}
 

@@ -169,7 +169,7 @@ func (p *ONNXProvider) Embed(ctx context.Context, docs []Document) ([]Vector, er
 	}
 	if header.Provider == "CPUExecutionProvider" {
 		if isCUDADevice(p.Device) {
-			fmt.Fprintf(os.Stderr, "warning: CUDA was requested but embeddings fell back to CPU; install CUDA 12 + cuDNN 9 runtime libraries or run: %s -m pip install nvidia-cublas-cu12 nvidia-cudnn-cu12 nvidia-cuda-runtime-cu12 nvidia-cufft-cu12 nvidia-curand-cu12\n", p.PythonPath)
+			return nil, fmt.Errorf("CUDA was requested but embeddings fell back to CPU; install CUDA 12 + cuDNN 9 runtime libraries, or use --device cpu to explicitly run on CPU")
 		} else if strings.TrimSpace(strings.ToLower(p.Device)) != "cpu" {
 			fmt.Fprintln(os.Stderr, "info: embeddings are running on CPUExecutionProvider")
 		}
@@ -671,6 +671,11 @@ func ensurePythonDeps(pythonPath string) error {
 	return nil
 }
 
+func hasCUDAProvider(pythonPath string) bool {
+	cmd := exec.Command(pythonPath, "-c", "import onnxruntime; assert 'CUDAExecutionProvider' in onnxruntime.get_available_providers()")
+	return cmd.Run() == nil
+}
+
 func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 	cacheDir, err := userCacheDir()
 	if err != nil {
@@ -681,9 +686,13 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 
 	if fileExists(runtimePython) {
 		if err := ensurePythonDeps(runtimePython); err == nil {
-			return runtimePython, nil
+			if !isCUDADevice(device) || hasCUDAProvider(runtimePython) {
+				return runtimePython, nil
+			}
+			fmt.Fprintf(os.Stderr, "info: existing embedding runtime lacks CUDA support; upgrading to onnxruntime-gpu\n")
+		} else {
+			fmt.Fprintf(os.Stderr, "info: existing embedding runtime at %s is missing dependencies; reinstalling\n", runtimePython)
 		}
-		fmt.Fprintf(os.Stderr, "info: existing embedding runtime at %s is missing dependencies; reinstalling\n", runtimePython)
 	}
 
 	if !dirExists(runtimeDir) {
@@ -694,31 +703,15 @@ func ensureEmbeddedRuntime(basePython string, device string) (string, error) {
 		}
 	}
 
-	packages := []string{"onnxruntime"}
+	onnxPackage := "onnxruntime"
 	if isCUDADevice(device) {
-		packages = []string{"onnxruntime-gpu", "onnxruntime"}
+		onnxPackage = "onnxruntime-gpu"
 	}
-	var installErr error
-	for i, onnxPackage := range packages {
-		fmt.Fprintf(os.Stderr, "info: installing embedding dependencies with uv (%s) in %s\n", onnxPackage, runtimePython)
-		if err := installRuntimePackagesWithUV(runtimePython, "numpy", onnxPackage, "tokenizers"); err != nil {
-			if i+1 < len(packages) {
-				fmt.Fprintf(os.Stderr, "warning: failed to install %s; falling back to %s\n", onnxPackage, packages[i+1])
-				if packages[i+1] == "onnxruntime" {
-					fmt.Fprintln(os.Stderr, "warning: GPU acceleration will not be available; embedding will run on CPU which may be significantly slower")
-					fmt.Fprintln(os.Stderr, "warning: to use GPU, install CUDA 12 toolkit and retry with: wave index --device cuda")
-				}
-			}
-			installErr = fmt.Errorf("install embedding runtime dependencies (%s): %w", onnxPackage, err)
-			continue
-		}
-		fmt.Fprintf(os.Stderr, "info: embedding dependencies installed with %s\n", onnxPackage)
-		installErr = nil
-		break
+	fmt.Fprintf(os.Stderr, "info: installing embedding dependencies with uv (%s) in %s\n", onnxPackage, runtimePython)
+	if err := installRuntimePackagesWithUV(runtimePython, "numpy", onnxPackage, "tokenizers"); err != nil {
+		return "", fmt.Errorf("install embedding runtime dependencies (%s): %w", onnxPackage, err)
 	}
-	if installErr != nil {
-		return "", installErr
-	}
+	fmt.Fprintf(os.Stderr, "info: embedding dependencies installed with %s\n", onnxPackage)
 	if isCUDADevice(device) {
 		ensureNvidiaCUDALibs(runtimePython)
 	}
